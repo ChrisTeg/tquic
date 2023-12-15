@@ -39,7 +39,7 @@ const C: f64 = 0.4;
 /// W_cubic(0) = W_max * beta_cubic. Default to 0.7.
 ///
 /// See <https://www.rfc-editor.org/rfc/rfc9438.html#name-constants-of-interest>.
-const BETA: f64 = 0.7;
+const BETA: f64 = 0.8;
 
 /// Cubic constant alpha.
 ///
