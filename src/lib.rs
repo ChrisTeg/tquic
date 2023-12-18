@@ -130,7 +130,7 @@ const CONNECTION_WINDOW_FACTOR: f64 = 1.5;
 /// previous RTT is available, the initial RTT SHOULD be set to 333 milliseconds.
 /// This results in handshakes starting with a PTO of 1 second, as recommended
 /// for TCP's initial RTO
-const INITIAL_RTT: Duration = Duration::from_millis(25);
+const INITIAL_RTT: Duration = Duration::from_millis(333);
 
 /// Default handshake timeout is 30 seconds.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
