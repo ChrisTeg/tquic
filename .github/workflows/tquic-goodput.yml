@@ -16,7 +16,7 @@ jobs:
       matrix:
         impl: [tquic,lsquic,quiche]
         case: [goodput100k,goodput1m,goodput10m]
-        cc: [cubic, bbr]
+        cc: [cubic]
 
     steps:
     - name: Install quic-interop-runner
