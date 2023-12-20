@@ -277,6 +277,9 @@ impl Recovery {
 
                 // TODO: update rtt.
 
+                // inflight < cwnd
+                let app_limited: bool = self.can_send();
+
                 largest_newly_acked_pkt_num = sent_pkt.pkt_num;
                 largest_newly_acked_sent_time = sent_pkt.time_sent;
                 if sent_pkt.ack_eliciting {
@@ -295,7 +298,7 @@ impl Recovery {
                     self.congestion.on_ack(
                         sent_pkt,
                         now,
-                        false,
+                        app_limited,
                         &self.rtt,
                         self.bytes_in_flight as u64,
                     );
