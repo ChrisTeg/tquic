@@ -39,7 +39,7 @@ const C: f64 = 0.4;
 /// W_cubic(0) = W_max * beta_cubic. Default to 0.7.
 ///
 /// See <https://www.rfc-editor.org/rfc/rfc9438.html#name-constants-of-interest>.
-const BETA: f64 = 0.8;
+const BETA: f64 = 0.875;
 
 /// Cubic constant alpha.
 ///
@@ -94,7 +94,7 @@ impl CubicConfig {
             initial_congestion_window,
             initial_rtt,
             max_datagram_size,
-            hystart_enabled: true,
+            hystart_enabled: false,
             fast_convergence_enabled: true,
         }
     }
@@ -271,17 +271,17 @@ impl CongestionController for Cubic {
     fn on_sent(&mut self, now: Instant, packet: &mut SentPacket, bytes_in_flight: u64) {
         // Better follow cubic curve after idle period.
         // See <https://github.com/torvalds/linux/commit/30927520dbae297182990bb21d08762bcc35ce1d>.
-        if bytes_in_flight == 0 {
-            if let Some(last_sent_time) = self.last_sent_time {
-                if let Some(recovery_epoch_start) = self.recovery_epoch_start {
-                    // Shifted later in time by the amount of the idle period.
-                    self.recovery_epoch_start = Some(
-                        recovery_epoch_start
-                            + packet.time_sent.saturating_duration_since(last_sent_time),
-                    );
-                }
-            }
-        }
+        // if bytes_in_flight == 0 {
+        //     if let Some(last_sent_time) = self.last_sent_time {
+        //         if let Some(recovery_epoch_start) = self.recovery_epoch_start {
+        //             // Shifted later in time by the amount of the idle period.
+        //             self.recovery_epoch_start = Some(
+        //                 recovery_epoch_start
+        //                     + packet.time_sent.saturating_duration_since(last_sent_time),
+        //             );
+        //         }
+        //     }
+        // }
 
         self.last_sent_time = Some(packet.time_sent);
         self.hystart.on_sent(packet.pkt_num);
