@@ -119,7 +119,7 @@ pub struct ServerOpt {
     pub recv_udp_payload_size: u16,
 
     /// Set the maximum outgoing UDP payload size.
-    #[clap(long, default_value = "1200", value_name = "NUM")]
+    #[clap(long, default_value = "1460", value_name = "NUM")]
     pub send_udp_payload_size: usize,
 
     /// Handshake timeout in microseconds.
