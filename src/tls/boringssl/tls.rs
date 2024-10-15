@@ -48,6 +48,12 @@ struct SslCipher(c_void);
 struct SslSession(c_void);
 
 #[repr(transparent)]
+struct X509Store(c_void);
+
+#[repr(transparent)]
+struct X509(c_void);
+
+#[repr(transparent)]
 struct X509VerifyParam(c_void);
 
 #[repr(transparent)]
@@ -83,6 +89,39 @@ struct SslQuicMethod {
     flush_flight: extern "C" fn(ssl: *mut Ssl) -> c_int,
 
     send_alert: extern "C" fn(ssl: *mut Ssl, level: tls::Level, alert: u8) -> c_int,
+}
+
+#[repr(C)]
+enum SslEarlyDataReason {
+    // The handshake has not progressed far enough for the 0-RTT status to be known.
+    Unknown = 0,
+    // 0-RTT is disabled for this connection.
+    Disabled = 1,
+    // 0-RTT was accepted.
+    Accepted = 2,
+    // The negotiated protocol version does not support 0-RTT.
+    ProtocolVersion = 3,
+    // The peer declined to offer or accept 0-RTT for an unknown reason.
+    PeerDeclined = 4,
+    // The client did not offer a session.
+    NoSessionOffered = 5,
+    // The server declined to resume the session.
+    SessionNotResumed = 6,
+    // The session does not support 0-RTT.
+    UnsupportedForSession = 7,
+    // The server sent a HelloRetryRequest.
+    HelloRetryRequest = 8,
+    // The negotiated ALPN protocol did not match the session.
+    AlpnMismatch = 9,
+    // The connection negotiated Channel ID, which is incompatible with 0-RTT.
+    ChannelId = 10,
+    // Value 11 is reserved. (It has historically |ssl_early_data_token_binding|.)
+    // The client and server ticket age were too far apart.
+    TicketAgeSkew = 12,
+    // QUIC parameters differ between this connection and the original.
+    QuicParameterMismatch = 13,
+    // The application settings did not match the session.
+    AlpsMismatch = 14,
 }
 
 /// Called when TLS context is being destroyed.
@@ -127,7 +166,7 @@ static SSL_QUIC_METHOD: SslQuicMethod = SslQuicMethod {
 
 /// Rust wrapper of SSL_CTX which holds various configuration and data relevant
 /// to SSL/TLS session establishment.
-pub struct Context {
+pub(crate) struct Context {
     ctx_raw: *mut SslCtx,
     owned: bool,
 }
@@ -167,12 +206,12 @@ impl Context {
     }
 
     /// Return the mutable pointer of the inner SSL_CTX.
-    fn as_mut_ptr(&mut self) -> *mut SslCtx {
+    pub fn as_mut_ptr(&mut self) -> *mut SslCtx {
         self.ctx_raw
     }
 
     /// Return the const pointer of the inner SSL_CTX.
-    fn as_ptr(&self) -> *const SslCtx {
+    pub fn as_ptr(&self) -> *const SslCtx {
         self.ctx_raw
     }
 
@@ -244,6 +283,7 @@ impl Context {
     }
 
     /// Load trust anchors from directory in OpenSSL's hashed directory format.
+    #[cfg(not(windows))]
     fn set_default_verify_paths(&mut self) -> Result<()> {
         match unsafe { SSL_CTX_set_default_verify_paths(self.as_mut_ptr()) } {
             1 => Ok(()),
@@ -253,8 +293,50 @@ impl Context {
         }
     }
 
+    #[cfg(windows)]
+    fn set_default_verify_paths(&mut self) -> Result<()> {
+        unsafe {
+            // Open system certificate store
+            let cstr = ffi::CString::new("Root")
+                .map_err(|_| Error::TlsFail("CString::new".to_string()))?;
+            let sys_store = winapi::um::wincrypt::CertOpenSystemStoreA(
+                0,
+                cstr.as_ptr() as winapi::um::winnt::LPCSTR,
+            );
+            if sys_store.is_null() {
+                return Err(Error::TlsFail("open system store".to_string()));
+            }
+
+            // Get the certificate store for the current SSLContext
+            let crt_store = SSL_CTX_get_cert_store(self.as_mut_ptr());
+            if crt_store.is_null() {
+                winapi::um::wincrypt::CertCloseStore(sys_store, 0);
+                return Err(Error::TlsFail("get cert store".to_string()));
+            }
+
+            // Retrieve certificates in the system certificate store and add them
+            // to the X509_STORE for the current SSLContext.
+            let mut ctx_p =
+                winapi::um::wincrypt::CertEnumCertificatesInStore(sys_store, ptr::null());
+            while !ctx_p.is_null() {
+                let in_p = (*ctx_p).pbCertEncoded as *const u8;
+                let cert = d2i_X509(ptr::null_mut(), &in_p, (*ctx_p).cbCertEncoded as i32);
+                if !cert.is_null() {
+                    X509_STORE_add_cert(crt_store, cert);
+                    X509_free(cert);
+                }
+                ctx_p = winapi::um::wincrypt::CertEnumCertificatesInStore(sys_store, ctx_p);
+            }
+
+            winapi::um::wincrypt::CertFreeCertificateContext(ctx_p);
+            winapi::um::wincrypt::CertCloseStore(sys_store, 0);
+        }
+
+        Ok(())
+    }
+
     /// Set the callback function that is called whenever a new session was negotiated.
-    fn set_session_callback(&mut self) {
+    pub fn set_session_callback(&mut self) {
         unsafe {
             SSL_CTX_set_session_cache_mode(
                 self.as_mut_ptr(),
@@ -330,6 +412,13 @@ impl Context {
 
         unsafe {
             SSL_CTX_set_early_data_enabled(self.as_mut_ptr(), enabled);
+        }
+    }
+
+    /// Set the lifetime, in seconds, of TLS 1.3 sessions created in ctx to timeout.
+    pub fn set_session_psk_dhe_timeout(&mut self, timeout: u32) {
+        unsafe {
+            SSL_CTX_set_session_psk_dhe_timeout(self.as_mut_ptr(), timeout);
         }
     }
 }
@@ -629,7 +718,6 @@ impl Session {
             let sigalg_name = SSL_get_signature_algorithm_name(sigalg_id, 1);
             match ffi::CStr::from_ptr(sigalg_name).to_str() {
                 Ok(v) => v,
-
                 Err(_) => return None,
             }
         };
@@ -684,6 +772,23 @@ impl Session {
         };
 
         Some(peer_cert)
+    }
+
+    pub fn early_data_reason(&self) -> Result<Option<&str>> {
+        let reason = unsafe {
+            let reason = SSL_early_data_reason_string(SSL_get_early_data_reason(self.as_ptr()));
+            match ffi::CStr::from_ptr(reason).to_str() {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(Error::TlsFail(format!(
+                        "early data reason format error {:?}",
+                        e
+                    )))
+                }
+            }
+        };
+
+        Ok(Some(reason))
     }
 
     /// Return true if ssl has a completed handshake.
@@ -855,7 +960,7 @@ extern "C" fn set_read_secret(
     if level != tls::Level::ZeroRTT || session_data.is_server {
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
 
-        let open = match crypto::Open::new_with_secret(aead, secret) {
+        let open = match crypto::Open::new_with_secret(aead, secret.to_vec()) {
             Ok(v) => v,
             Err(_) => return 0,
         };
@@ -896,7 +1001,7 @@ extern "C" fn set_write_secret(
     if level != tls::Level::ZeroRTT || !session_data.is_server {
         let secret = unsafe { slice::from_raw_parts(secret, secret_len) };
 
-        let seal = match crypto::Seal::new_with_secret(aead, secret) {
+        let seal = match crypto::Seal::new_with_secret(aead, secret.to_vec()) {
             Ok(v) => v,
             Err(_) => return 0,
         };
@@ -1208,6 +1313,9 @@ extern "C" {
     /// Load trust anchors from directory in OpenSSL's hashed directory format.
     fn SSL_CTX_set_default_verify_paths(ctx: *mut SslCtx) -> c_int;
 
+    /// Return ctx's certificate store.
+    fn SSL_CTX_get_cert_store(ctx: *mut SslCtx) -> *mut X509Store;
+
     /// Configure certificate verification behavior.
     fn SSL_CTX_set_verify(ctx: *mut SslCtx, mode: c_int, cb: *const c_void);
 
@@ -1243,6 +1351,9 @@ extern "C" {
 
     /// Set whether early data is allowed.
     fn SSL_CTX_set_early_data_enabled(ctx: *mut SslCtx, enabled: i32);
+
+    /// Set the lifetime, in seconds, of TLS 1.3 sessions created in ctx to timeout.
+    fn SSL_CTX_set_session_psk_dhe_timeout(ctx: *mut SslCtx, timeout: u32);
 
     /// Set the session cache mode.
     fn SSL_CTX_set_session_cache_mode(ctx: *mut SslCtx, mode: c_int) -> c_int;
@@ -1420,6 +1531,12 @@ extern "C" {
     /// For a server, return the hostname supplied by the client.
     fn SSL_get_servername(ssl: *const Ssl, ty: c_int) -> *const c_char;
 
+    /// Return details why 0-RTT was accepted or rejected on ssl.
+    fn SSL_get_early_data_reason(ssl: *const Ssl) -> SslEarlyDataReason;
+
+    /// Return a string representation for reason, or NULL if reason is unknown.
+    fn SSL_early_data_reason_string(reason: SslEarlyDataReason) -> *const c_char;
+
     /// Reset ssl to allow another connection.
     fn SSL_clear(ssl: *mut Ssl) -> c_int;
 
@@ -1446,6 +1563,16 @@ extern "C" {
     /// Decrements the reference count of session.
     /// If it reaches zero, all data referenced by session and session itself are released.
     fn SSL_SESSION_free(session: *mut SslSession);
+
+    /// Add the cert object to the X509_STORE's local storage.
+    fn X509_STORE_add_cert(ctx: *mut X509Store, x: *mut X509) -> c_int;
+
+    /// Decrement the reference count of X509 structure a and frees it up if
+    /// the reference count is zero.
+    fn X509_free(x: *mut X509);
+
+    /// Decode input bytes and return a pointer to the X509 structure
+    fn d2i_X509(px: *mut X509, input: *const *const u8, len: c_int) -> *mut X509;
 
     /// Set cerfificate verification hostname.
     fn X509_VERIFY_PARAM_set1_host(

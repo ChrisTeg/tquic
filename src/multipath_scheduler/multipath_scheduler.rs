@@ -26,6 +26,7 @@ use crate::connection::space::SentPacket;
 use crate::connection::stream::StreamMap;
 use crate::Error;
 use crate::MultipathConfig;
+use crate::PathEvent;
 use crate::Result;
 
 /// MultipathScheduler is a packet scheduler that decides the path over which
@@ -53,9 +54,13 @@ pub(crate) trait MultipathScheduler {
         streams: &mut StreamMap,
     ) {
     }
+
+    /// Process a path event.
+    fn on_path_updated(&mut self, paths: &mut PathMap, event: PathEvent) {}
 }
 
-/// Available multipath scheduling algorithm
+/// Available multipath scheduling algorithms.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MultipathAlgorithm {
     /// The scheduler sends packets over the path with the lowest smoothed RTT
@@ -98,14 +103,14 @@ impl FromStr for MultipathAlgorithm {
 
 /// Build a multipath scheduler
 pub(crate) fn build_multipath_scheduler(conf: &MultipathConfig) -> Box<dyn MultipathScheduler> {
-    match conf.multipath_algor {
+    match conf.multipath_algorithm {
         MultipathAlgorithm::MinRtt => Box::new(MinRttScheduler::new(conf)),
         MultipathAlgorithm::Redundant => Box::new(RedundantScheduler::new(conf)),
         MultipathAlgorithm::RoundRobin => Box::new(RoundRobinScheduler::new(conf)),
     }
 }
 
-pub(crate) fn reinjection_required(algor: MultipathAlgorithm) -> bool {
+pub(crate) fn buffer_required(algor: MultipathAlgorithm) -> bool {
     match algor {
         MultipathAlgorithm::MinRtt => false,
         MultipathAlgorithm::Redundant => true,
@@ -132,7 +137,7 @@ pub(crate) mod tests {
         /// Create context for multipath scheduler.
         pub(crate) fn new() -> Result<MultipathTester> {
             let path = new_test_path("127.0.0.1:443", "127.0.0.1:8443", true, 200);
-            let mut paths = PathMap::new(path, 8, true);
+            let mut paths = PathMap::new(path, 8, crate::ANTI_AMPLIFICATION_FACTOR, true);
             paths.enable_multipath();
 
             let spaces = PacketNumSpaceMap::new();

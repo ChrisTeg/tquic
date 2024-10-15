@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use std::io::ErrorKind;
-use std::net::IpAddr;
-use std::net::Ipv4Addr;
-use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 
-use log::debug;
+use clap::builder::PossibleValue;
+use clap::ValueEnum;
+use env_logger::Target;
+use log::*;
 use mio::net::UdpSocket;
 use mio::Interest;
 use mio::Registry;
@@ -31,17 +31,61 @@ use tquic::PacketSendHandler;
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-/// Supported ALPNs.
-pub mod alpns {
-    pub const HTTP_09: [&[u8]; 2] = [b"hq-interop", b"http/0.9"];
-    pub const HTTP_3: [&[u8]; 1] = [b"h3"];
-}
+/// Supported application protocols.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub enum ApplicationProto {
+    /// Proto for QUIC interop, see https://github.com/quic-interop/quic-interop-runner
+    Interop,
 
-#[derive(Default, PartialEq)]
-pub enum AppProto {
+    /// HTTP/0.9, see https://http.dev/0.9
     Http09,
+
+    /// HTTP/3, see https://www.rfc-editor.org/rfc/rfc9114.html
     #[default]
     H3,
+}
+
+impl ApplicationProto {
+    /// Create a new ApplicationProto from byte slice.
+    pub fn from_slice(proto: &[u8]) -> Self {
+        match proto {
+            b"hq-interop" => Self::Interop,
+            b"http/0.9" => Self::Http09,
+            b"h3" => Self::H3,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Convert an ApplicationProto into a byte slice.
+    pub fn to_slice(&self) -> &[u8] {
+        match self {
+            Self::Interop => b"hq-interop",
+            Self::Http09 => b"http/0.9",
+            Self::H3 => b"h3",
+        }
+    }
+
+    /// Convert an ApplicationProto slice to a two-dimension byte vector.
+    pub fn convert_to_vec(protos: &[Self]) -> Vec<Vec<u8>> {
+        protos
+            .iter()
+            .map(|proto| proto.to_slice().to_vec())
+            .collect()
+    }
+}
+
+impl ValueEnum for ApplicationProto {
+    fn to_possible_value(&self) -> Option<PossibleValue> {
+        Some(match self {
+            Self::Interop => PossibleValue::new("hq-interop"),
+            Self::Http09 => PossibleValue::new("http/0.9"),
+            Self::H3 => PossibleValue::new("h3"),
+        })
+    }
+
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Interop, Self::Http09, Self::H3]
+    }
 }
 
 /// UDP socket wrapper for QUIC
@@ -76,21 +120,13 @@ impl QuicSocket {
         })
     }
 
-    pub fn new_client_socket(is_ipv4: bool, registry: &Registry) -> Result<Self> {
-        let local = match is_ipv4 {
-            true => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            false => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        };
-        QuicSocket::new(&SocketAddr::new(local, 0), registry)
-    }
-
     /// Return the local address of the initial socket.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
     }
 
     /// Add additional socket binding with given local address.
-    pub fn add(&mut self, local: &SocketAddr, registry: &Registry) -> Result<()> {
+    pub fn add(&mut self, local: &SocketAddr, registry: &Registry) -> Result<SocketAddr> {
         let socket = UdpSocket::bind(*local)?;
         let local_addr = socket.local_addr()?;
         let sid = self.socks.insert(socket);
@@ -98,7 +134,7 @@ impl QuicSocket {
 
         let socket = self.socks.get_mut(sid).unwrap();
         registry.register(socket, Token(sid), Interest::READABLE)?;
-        Ok(())
+        Ok(local_addr)
     }
 
     /// Delete socket binding with given local address.
@@ -175,4 +211,20 @@ impl PacketSendHandler for QuicSocket {
         }
         Ok(count)
     }
+}
+
+/// Get the target for the log output.
+pub fn log_target(log_file: &Option<String>) -> Result<Target> {
+    if let Some(log_file) = log_file {
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_file)
+        {
+            return Ok(Target::Pipe(Box::new(file)));
+        }
+        return Err(format!("create log file {:?} failed", log_file).into());
+    }
+
+    Ok(Target::Stderr)
 }

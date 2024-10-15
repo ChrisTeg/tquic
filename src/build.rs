@@ -23,23 +23,50 @@ const CMAKE_PARAMS_ANDROID_NDK: &[(&str, &[(&str, &str)])] = &[
 /// Additional parameters for iOS
 const CMAKE_PARAMS_IOS: &[(&str, &[(&str, &str)])] = &[
     (
-        "aarch64",
+        "aarch64-apple-ios",
         &[
             ("CMAKE_OSX_ARCHITECTURES", "arm64"),
             ("CMAKE_OSX_SYSROOT", "iphoneos"),
+            ("CMAKE_ASM_FLAGS", "-fembed-bitcode -target arm64-apple-ios"),
         ],
     ),
     (
-        "x86_64",
+        "aarch64-apple-ios-sim",
+        &[
+            ("CMAKE_OSX_ARCHITECTURES", "arm64"),
+            ("CMAKE_OSX_SYSROOT", "iphonesimulator"),
+            (
+                "CMAKE_ASM_FLAGS",
+                "-fembed-bitcode -target arm64-apple-ios-simulator",
+            ),
+            ("CMAKE_THREAD_LIBS_INIT", "-lpthread"),
+            ("CMAKE_HAVE_THREADS_LIBRARY", "1"),
+            ("THREADS_PREFER_PTHREAD_FLAG", "ON"),
+        ],
+    ),
+    (
+        "x86_64-apple-ios",
         &[
             ("CMAKE_OSX_ARCHITECTURES", "x86_64"),
             ("CMAKE_OSX_SYSROOT", "iphonesimulator"),
+            (
+                "CMAKE_ASM_FLAGS",
+                "-fembed-bitcode -target x86_64-apple-ios-simulator",
+            ),
         ],
     ),
 ];
 
+/// Additional parameters for Ohos
+const CMAKE_PARAMS_OHOS_NDK: &[(&str, &[(&str, &str)])] = &[
+    ("aarch64", &[("OHOS_ARCH", "arm64-v8a")]),
+    ("arm", &[("OHOS_ARCH", "armeabi-v7a")]),
+    ("x86_64", &[("OHOS_ARCH", "x86_64")]),
+];
+
 /// Create a cmake::Config for building BoringSSL.
 fn new_boringssl_cmake_config() -> cmake::Config {
+    let target = std::env::var("TARGET").unwrap();
     let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
     let os = std::env::var("CARGO_CFG_TARGET_OS").unwrap();
 
@@ -68,27 +95,69 @@ fn new_boringssl_cmake_config() -> cmake::Config {
         }
 
         "ios" => {
-            for (ios_arch, params) in CMAKE_PARAMS_IOS {
-                if *ios_arch == arch {
+            for (ios_target, params) in CMAKE_PARAMS_IOS {
+                if *ios_target == target {
                     for (name, value) in *params {
                         boringssl_cmake.define(name, value);
+                        if *name == "CMAKE_ASM_FLAGS" {
+                            boringssl_cmake.cflag(value);
+                        }
                     }
                     break;
                 }
             }
+        }
 
-            let mut cflag = "-fembed-bitcode".to_string();
-            if arch == "x86_64" {
-                cflag.push_str(" -target x86_64-apple-ios-simulator");
+        "linux" => {
+            if target.ends_with("ohos") {
+                for (ohos_arch, params) in CMAKE_PARAMS_OHOS_NDK {
+                    if *ohos_arch == arch {
+                        for (name, value) in *params {
+                            boringssl_cmake.define(name, value);
+                        }
+                        break;
+                    }
+                }
+
+                let ohos_ndk_home = std::env::var("OHOS_NDK_HOME")
+                    .expect("Please set OHOS_NDK_HOME for Harmony build");
+                let ohos_ndk_home = std::path::Path::new(&ohos_ndk_home);
+                let toolchain_file = ohos_ndk_home.join("native/build/cmake/ohos.toolchain.cmake");
+                let toolchain_file = toolchain_file.to_str().unwrap();
+                boringssl_cmake.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
+                // common arguments for ohos help us to ignore some error
+                boringssl_cmake.define("CMAKE_C_FLAGS", "-Wno-unused-command-line-argument");
+                boringssl_cmake.define("CMAKE_CXX_FLAGS", "-Wno-unused-command-line-argument");
             }
-            boringssl_cmake.define("CMAKE_ASM_FLAGS", &cflag);
-            boringssl_cmake.cflag(&cflag);
         }
 
         _ => (),
     };
 
     boringssl_cmake
+}
+
+/// Return the build sub-dir for boringssl.
+fn get_boringssl_build_sub_dir() -> &'static str {
+    if !cfg!(target_env = "msvc") {
+        return "";
+    }
+
+    // Note: MSVC outputs static libs in a sub-directory.
+    let debug = std::env::var("DEBUG").expect("DEBUG not set");
+    let opt_level = std::env::var("OPT_LEVEL").expect("OPT_LEVEL not set");
+
+    match &opt_level[..] {
+        "1" | "2" | "3" => {
+            if &debug[..] == "true" {
+                "RelWithDebInfo"
+            } else {
+                "Release"
+            }
+        }
+        "s" | "z" => "MinSizeRel",
+        _ => "Debug",
+    }
 }
 
 fn main() {
@@ -105,7 +174,8 @@ fn main() {
             cfg.build_target("ssl").build();
             cfg.build_target("crypto").build().display().to_string()
         };
-        let build_dir = format!("{boringssl_dir}/build/");
+        let sub_dir = get_boringssl_build_sub_dir();
+        let build_dir = format!("{boringssl_dir}/build/{sub_dir}");
         println!("cargo:rustc-link-search=native={build_dir}");
     }
 

@@ -14,18 +14,18 @@
 
 //! An QUIC server based on the high level endpoint API.
 
-use std::cmp;
 use std::collections::HashMap;
+use std::fs::create_dir_all;
 use std::fs::File;
 use std::net::SocketAddr;
 use std::path;
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
 use bytes::Bytes;
 use clap::Parser;
-use log::debug;
-use log::error;
+use log::*;
 use mio::event::Event;
 use rustc_hash::FxHashMap;
 
@@ -42,18 +42,21 @@ use tquic::MultipathAlgorithm;
 use tquic::PacketInfo;
 use tquic::TlsConfig;
 use tquic::TransportHandler;
-use tquic::TIMER_GRANULARITY;
-use tquic_tools::alpns;
-use tquic_tools::AppProto;
+use tquic_tools::ApplicationProto;
 use tquic_tools::QuicSocket;
 use tquic_tools::Result;
 
+#[cfg(unix)]
 #[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
 #[derive(Parser, Debug)]
-#[clap(name = "server")]
+#[clap(name = "server", version=env!("CARGO_PKG_VERSION"))]
 pub struct ServerOpt {
+    /// Address to listen.
+    #[clap(short, long, default_value = "0.0.0.0:4433", value_name = "ADDR")]
+    pub listen: SocketAddr,
+
     /// TLS certificate in PEM format.
     #[clap(
         short,
@@ -67,93 +70,184 @@ pub struct ServerOpt {
     #[clap(short, long = "key", default_value = "./cert.key", value_name = "FILE")]
     pub key_file: String,
 
-    /// Log level, support OFF/ERROR/WARN/INFO/DEBUG/TRACE.
-    #[clap(long, default_value = "INFO")]
-    pub log_level: log::LevelFilter,
-
-    /// Address to listen.
-    #[clap(short, long, default_value = "0.0.0.0:4433", value_name = "ADDR")]
-    pub listen: SocketAddr,
-
     /// Document root directory.
-    #[clap(long, default_value = "./", value_name = "DIR")]
+    #[clap(short, long, default_value = "./", value_name = "DIR")]
     pub root: String,
 
     /// Session ticket key.
-    #[clap(long, default_value = "tquic key", value_name = "STR")]
+    #[clap(
+        short,
+        long,
+        default_value = "tquic key",
+        value_name = "STR",
+        help_heading = "Protocol"
+    )]
     pub ticket_key: String,
 
     /// Key for generating address token.
-    #[clap(long, value_name = "STR")]
+    #[clap(long, value_name = "STR", help_heading = "Protocol")]
     pub address_token_key: Option<String>,
 
     /// Enable stateless retry.
-    #[clap(long)]
+    #[clap(long, help_heading = "Protocol")]
     pub enable_retry: bool,
 
     /// Disable stateless reset.
-    #[clap(long)]
+    #[clap(long, help_heading = "Protocol")]
     pub disable_stateless_reset: bool,
 
     /// Congestion control algorithm.
-    #[clap(long, default_value = "BBR")]
+    #[clap(long, default_value = "BBR", help_heading = "Protocol")]
     pub congestion_control_algor: CongestionControlAlgorithm,
 
     /// Initial congestion window in packets.
-    #[clap(long, default_value = "32", value_name = "NUM")]
+    #[clap(
+        long,
+        default_value = "32",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
     pub initial_congestion_window: u64,
 
     /// Minimum congestion window in packets.
-    #[clap(long, default_value = "4", value_name = "NUM")]
+    #[clap(
+        long,
+        default_value = "4",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
     pub min_congestion_window: u64,
 
     /// Enable multipath transport.
-    #[clap(long)]
+    #[clap(short, long, help_heading = "Protocol")]
     pub enable_multipath: bool,
 
     /// Multipath scheduling algorithm
-    #[clap(long, default_value = "MINRTT")]
+    #[clap(short, long, default_value = "MINRTT", help_heading = "Protocol")]
     pub multipath_algor: MultipathAlgorithm,
 
+    /// Set active_connection_id_limit transport parameter. Values lower than 2 will be ignored.
+    #[clap(
+        long,
+        default_value = "2",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
+    pub active_cid_limit: u64,
+
     /// Set max_udp_payload_size transport parameter.
-    #[clap(long, default_value = "65527", value_name = "NUM")]
+    #[clap(
+        long,
+        default_value = "65527",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
     pub recv_udp_payload_size: u16,
 
     /// Set the maximum outgoing UDP payload size.
-    #[clap(long, default_value = "1200", value_name = "NUM")]
+    #[clap(
+        long,
+        default_value = "1200",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
     pub send_udp_payload_size: usize,
 
     /// Handshake timeout in microseconds.
-    #[clap(long, default_value = "10000", value_name = "TIME")]
+    #[clap(
+        long,
+        default_value = "10000",
+        value_name = "TIME",
+        help_heading = "Protocol"
+    )]
     pub handshake_timeout: u64,
 
     /// Connection idle timeout in microseconds.
-    #[clap(long, default_value = "30000", value_name = "TIME")]
+    #[clap(
+        long,
+        default_value = "30000",
+        value_name = "TIME",
+        help_heading = "Protocol"
+    )]
     pub idle_timeout: u64,
 
     /// Initial RTT in milliseconds.
-    #[clap(long, default_value = "333", value_name = "TIME")]
+    #[clap(
+        long,
+        default_value = "333",
+        value_name = "TIME",
+        help_heading = "Protocol"
+    )]
     pub initial_rtt: u64,
 
     /// Linear factor for calculating the probe timeout.
-    #[clap(long, default_value = "3", value_name = "NUM")]
+    #[clap(
+        long,
+        default_value = "10",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
     pub pto_linear_factor: u64,
 
     /// Upper limit of probe timeout in microseconds.
-    #[clap(long, default_value = "10000", value_name = "TIME")]
+    #[clap(
+        long,
+        default_value = "10000",
+        value_name = "TIME",
+        help_heading = "Protocol"
+    )]
     pub max_pto: u64,
 
+    /// Anti amplification factor.
+    #[clap(
+        long,
+        default_value = "3",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
+    pub anti_amplification_factor: usize,
+
+    /// Length of connection id in bytes.
+    #[clap(
+        long,
+        default_value = "8",
+        value_name = "NUM",
+        help_heading = "Protocol"
+    )]
+    pub cid_len: usize,
+
+    /// Log level, support OFF/ERROR/WARN/INFO/DEBUG/TRACE.
+    #[clap(long, default_value = "INFO", help_heading = "Output")]
+    pub log_level: log::LevelFilter,
+
+    /// Log file path. If no file is specified, logs will be written to `stderr`.
+    #[clap(long, value_name = "FILE", help_heading = "Output")]
+    pub log_file: Option<String>,
+
     /// Save TLS key log into the given file.
-    #[clap(long, value_name = "FILE")]
+    #[clap(long, value_name = "FILE", help_heading = "Output")]
     pub keylog_file: Option<String>,
 
-    /// Save QUIC qlog into the given file.
-    #[clap(long, value_name = "FILE")]
-    pub qlog_file: Option<String>,
+    /// Save qlog file (<trace_id>.qlog) into the given directory.
+    #[clap(long, value_name = "DIR", help_heading = "Output")]
+    pub qlog_dir: Option<String>,
 
     /// Batch size for sending packets.
-    #[clap(long, default_value = "16", value_name = "NUM")]
+    #[clap(long, default_value = "16", value_name = "NUM", help_heading = "Misc")]
     pub send_batch_size: usize,
+
+    /// buffer size for disordered zerortt packets on the server.
+    #[clap(
+        long,
+        default_value = "1000",
+        value_name = "NUM",
+        help_heading = "Misc"
+    )]
+    pub zerortt_buffer_size: usize,
+
+    /// Disable encryption on 1-RTT packets.
+    #[clap(long, help_heading = "Misc")]
+    pub disable_encryption: bool,
 }
 
 const MAX_BUF_SIZE: usize = 65536;
@@ -186,12 +280,17 @@ impl Server {
         config.set_initial_rtt(option.initial_rtt);
         config.set_pto_linear_factor(option.pto_linear_factor);
         config.set_max_pto(option.max_pto);
+        config.set_cid_len(option.cid_len);
+        config.set_anti_amplification_factor(option.anti_amplification_factor);
         config.set_send_batch_size(option.send_batch_size);
+        config.set_zerortt_buffer_size(option.zerortt_buffer_size);
         config.set_congestion_control_algorithm(option.congestion_control_algor);
         config.set_initial_congestion_window(option.initial_congestion_window);
         config.set_min_congestion_window(option.min_congestion_window);
         config.enable_multipath(option.enable_multipath);
-        config.set_multipath_algor(option.multipath_algor);
+        config.set_multipath_algorithm(option.multipath_algor);
+        config.set_active_connection_id_limit(option.active_cid_limit);
+        config.enable_encryption(!option.disable_encryption);
 
         if let Some(address_token_key) = &option.address_token_key {
             let address_token_key = convert_address_token_key(address_token_key);
@@ -280,7 +379,7 @@ struct Response {
 #[derive(Default)]
 struct ConnectionHandler {
     /// Application protocol.
-    app_proto: AppProto,
+    app_proto: ApplicationProto,
 
     /// File root directory.
     root: String,
@@ -532,13 +631,12 @@ impl ConnectionHandler {
     }
 
     fn recv_request(&mut self, buf: &mut [u8], conn: &mut Connection, stream_id: u64) {
-        if self.app_proto == AppProto::H3 {
-            self.recv_h3_request(conn);
-        } else if self.app_proto == AppProto::Http09 {
-            self.recv_http09_request(buf, conn, stream_id);
-        } else {
-            unreachable!()
-        };
+        match self.app_proto {
+            ApplicationProto::Interop | ApplicationProto::Http09 => {
+                self.recv_http09_request(buf, conn, stream_id)
+            }
+            ApplicationProto::H3 => self.recv_h3_request(conn),
+        }
     }
 
     fn send_http09_response(&mut self, conn: &mut Connection, stream_id: u64) {
@@ -607,13 +705,12 @@ impl ConnectionHandler {
 
         _ = conn.stream_want_write(stream_id, true);
 
-        if self.app_proto == AppProto::H3 {
-            self.send_h3_response(conn, stream_id);
-        } else if self.app_proto == AppProto::Http09 {
-            self.send_http09_response(conn, stream_id);
-        } else {
-            unreachable!()
-        };
+        match self.app_proto {
+            ApplicationProto::Interop | ApplicationProto::Http09 => {
+                self.send_http09_response(conn, stream_id)
+            }
+            ApplicationProto::H3 => self.send_h3_response(conn, stream_id),
+        }
     }
 }
 
@@ -630,8 +727,8 @@ struct ServerHandler {
     /// SSL key logger
     keylog: Option<File>,
 
-    /// Qlog file
-    qlog: Option<File>,
+    /// Qlog directory
+    qlog_dir: Option<String>,
 }
 
 impl ServerHandler {
@@ -646,22 +743,12 @@ impl ServerHandler {
             None => None,
         };
 
-        let qlog = match &option.qlog_file {
-            Some(qlog_file) => Some(
-                std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(qlog_file)?,
-            ),
-            None => None,
-        };
-
         Ok(Self {
             root: option.root.clone(),
             buf: vec![0; MAX_BUF_SIZE],
             conns: FxHashMap::default(),
             keylog,
-            qlog,
+            qlog_dir: option.qlog_dir.clone(),
         })
     }
 
@@ -673,21 +760,17 @@ impl ServerHandler {
 
         debug!("{} new connection handler", conn.trace_id());
         let mut conn_handler = ConnectionHandler {
+            app_proto: ApplicationProto::from_slice(conn.application_proto()),
             root: self.root.clone(),
             ..Default::default()
         };
-        let app_proto = conn.application_proto();
-        if alpns::HTTP_09.contains(&app_proto) {
-            conn_handler.app_proto = AppProto::Http09;
-        } else if alpns::HTTP_3.contains(&app_proto) {
-            conn_handler.app_proto = AppProto::H3;
+
+        if conn_handler.app_proto == ApplicationProto::H3 {
             conn_handler.h3_conn = Some(
                 Http3Connection::new_with_quic_conn(conn, &Http3Config::new().unwrap()).unwrap(),
             );
-        } else {
-            error!("{} alpn unknown {:?}", conn.trace_id(), app_proto);
-            unreachable!();
         }
+
         self.conns.insert(index, conn_handler);
     }
 }
@@ -701,13 +784,28 @@ impl TransportHandler for ServerHandler {
             }
         }
 
-        if let Some(qlog) = &mut self.qlog {
-            if let Ok(qlog) = qlog.try_clone() {
+        // The qlog of each server connection is written to a different log file
+        // in JSON-SEQ format.
+        //
+        // Note: The server qlogs can also be written to the same file, with a
+        // recommended prefix for each line of logs that includes the trace id.
+        // The qlog of each connection can be then extracted by offline log
+        // processing.
+        if let Some(qlog_dir) = &self.qlog_dir {
+            let qlog_file = format!("{}.qlog", conn.trace_id());
+            let qlog_file = Path::new(qlog_dir).join(qlog_file);
+            if let Ok(qlog) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(qlog_file.as_path())
+            {
                 conn.set_qlog(
                     Box::new(qlog),
                     "server qlog".into(),
                     format!("id={}", conn.trace_id()),
                 );
+            } else {
+                error!("{} set qlog {:?} failed", conn.trace_id(), qlog_file);
             }
         }
     }
@@ -718,7 +816,18 @@ impl TransportHandler for ServerHandler {
     }
 
     fn on_conn_closed(&mut self, conn: &mut Connection) {
-        log::debug!("connection[{:?}] is closed", conn.trace_id());
+        let stats = conn.stats();
+        log::debug!(
+            "{} connection is closed. recv pkts: {}, sent pkts: {}, \
+            lost pkts: {}, recv bytes: {}, sent bytes: {}, lost bytes: {}",
+            conn.trace_id(),
+            stats.recv_count,
+            stats.sent_count,
+            stats.lost_count,
+            stats.recv_bytes,
+            stats.sent_bytes,
+            stats.lost_bytes
+        );
 
         let index = conn.index().unwrap();
         self.conns.remove(&index);
@@ -732,7 +841,9 @@ impl TransportHandler for ServerHandler {
 
         let index = conn.index().unwrap();
         let conn_handler = self.conns.get_mut(&index).unwrap();
-        if conn_handler.app_proto == AppProto::Http09 {
+        if conn_handler.app_proto == ApplicationProto::Interop
+            || conn_handler.app_proto == ApplicationProto::Http09
+        {
             conn_handler.http09_requests.insert(stream_id, b"".to_vec());
         }
     }
@@ -758,35 +869,49 @@ impl TransportHandler for ServerHandler {
     fn on_new_token(&mut self, _conn: &mut Connection, _token: Vec<u8>) {}
 }
 
-fn main() -> Result<()> {
-    let option = ServerOpt::parse();
+fn process_option(option: &mut ServerOpt) -> Result<()> {
+    env_logger::builder()
+        .target(tquic_tools::log_target(&option.log_file)?)
+        .filter_level(option.log_level)
+        .format_timestamp_millis()
+        .init();
 
-    // Initialize logging.
-    env_logger::builder().filter_level(option.log_level).init();
+    if let Some(qlog_dir) = &option.qlog_dir {
+        if let Err(e) = create_dir_all(qlog_dir) {
+            warn!("create qlog directory {} error: {:?}", qlog_dir, e);
+            return Err(Box::new(e));
+        }
+    }
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    // Parse and process server option
+    let mut option = ServerOpt::parse();
+    process_option(&mut option)?;
 
     // Initialize HTTP file server.
     let mut server = Server::new(&option)?;
 
     // Run event loop.
+    info!(
+        "{} listen on {:?}",
+        server.endpoint.trace_id(),
+        option.listen
+    );
     let mut events = mio::Events::with_capacity(1024);
     loop {
         if let Err(e) = server.endpoint.process_connections() {
             error!("process connections error: {:?}", e);
         }
 
-        let timeout = server
-            .endpoint
-            .timeout()
-            .map(|v| cmp::max(v, TIMER_GRANULARITY));
-        debug!("{} timeout: {:?}", server.endpoint.trace_id(), timeout);
-
+        let timeout = server.endpoint.timeout();
+        debug!(
+            "{} wait for io events, timeout: {:?}",
+            server.endpoint.trace_id(),
+            timeout
+        );
         server.poll.poll(&mut events, timeout)?;
-
-        // Process timeout events
-        if events.is_empty() {
-            server.endpoint.on_timeout(Instant::now());
-            continue;
-        }
 
         // Process IO events
         for event in events.iter() {
@@ -794,5 +919,10 @@ fn main() -> Result<()> {
                 server.process_read_event(event)?;
             }
         }
+
+        // Process timeout events.
+        // Note: Since `poll()` doesn't clearly tell if there was a timeout when it returns,
+        // it is up to the endpoint to check for a timeout and deal with it.
+        server.endpoint.on_timeout(Instant::now());
     }
 }

@@ -21,6 +21,10 @@ use bytes::BufMut;
 use crate::error::Error;
 use crate::Result;
 
+/// The maximum value for QUIC variable-length integer encoding
+/// See RFC 9000 Section 16
+pub const VINT_MAX: u64 = 4_611_686_018_427_387_903;
+
 /// Encoder for QUIC wire data
 pub trait Encoder {
     /// Write an unsigned 8 bit integer to self.
@@ -51,7 +55,7 @@ pub trait Encoder {
     /// Write an IPv4Addr to self in the big-endian byte order.
     fn write_ipv4_addr(&mut self, addr: &Ipv4Addr) -> Result<usize>;
 
-    /// Write an IPv4Addr to self in the big-endian byte order.
+    /// Write an IPv6Addr to self in the big-endian byte order.
     fn write_ipv6_addr(&mut self, addr: &Ipv6Addr) -> Result<usize>;
 }
 
@@ -313,7 +317,7 @@ pub fn decode_varint_len(first: u8) -> usize {
     }
 }
 
-/// Return the encoding length of a int using variable-length integer encoding.
+/// Return the encoding length of an int using variable-length integer encoding.
 ///
 /// See RFC 9000 Section 16 Table 4 Summary of Integer Encodings.
 pub fn encode_varint_len(n: u64) -> usize {

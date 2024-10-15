@@ -15,13 +15,13 @@
 // Note: The API is not stable and may change in future versions.
 
 use std::ffi;
+use std::io::Write;
 use std::mem;
 use std::net::Ipv4Addr;
 use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
-use std::os::fd::FromRawFd;
 use std::ptr;
 use std::rc::Rc;
 use std::slice;
@@ -30,25 +30,83 @@ use std::sync::atomic;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+
 use bytes::Bytes;
 use libc::c_char;
 use libc::c_int;
 use libc::c_void;
-use libc::in6_addr;
-use libc::in_addr;
-use libc::iovec;
-use libc::sa_family_t;
 use libc::size_t;
 use libc::sockaddr;
-use libc::sockaddr_in;
-use libc::sockaddr_in6;
-use libc::sockaddr_storage;
-use libc::socklen_t;
 use libc::ssize_t;
+
+#[cfg(not(windows))]
+use libc::in_addr;
+#[cfg(windows)]
+use winapi::shared::inaddr::IN_ADDR as in_addr;
+
+#[cfg(not(windows))]
+use libc::in6_addr;
+#[cfg(windows)]
+use winapi::shared::in6addr::IN6_ADDR as in6_addr;
+
+#[cfg(not(windows))]
+use libc::sa_family_t;
+#[cfg(windows)]
+use winapi::shared::ws2def::ADDRESS_FAMILY as sa_family_t;
+
+#[cfg(not(windows))]
+use libc::sockaddr_in;
+#[cfg(windows)]
+use winapi::shared::ws2def::SOCKADDR_IN as sockaddr_in;
+
+#[cfg(not(windows))]
+use libc::sockaddr_in6;
+#[cfg(windows)]
+use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH as sockaddr_in6;
+
+#[cfg(not(windows))]
+use libc::sockaddr_storage;
+#[cfg(windows)]
+use winapi::shared::ws2def::SOCKADDR_STORAGE_LH as sockaddr_storage;
+
+#[cfg(windows)]
+use libc::c_int as socklen_t;
+#[cfg(not(windows))]
+use libc::socklen_t;
+
+#[cfg(not(windows))]
 use libc::AF_INET;
+#[cfg(windows)]
+use winapi::shared::ws2def::AF_INET;
+
+#[cfg(not(windows))]
 use libc::AF_INET6;
+#[cfg(windows)]
+use winapi::shared::ws2def::AF_INET6;
+
+#[cfg(windows)]
+use winapi::shared::in6addr::in6_addr_u;
+#[cfg(windows)]
+use winapi::shared::inaddr::in_addr_S_un;
+#[cfg(windows)]
+use winapi::shared::ws2ipdef::SOCKADDR_IN6_LH_u;
+
+#[cfg(not(windows))]
+use libc::iovec;
+
+/// cbindgen:ignore
+#[cfg(windows)]
+#[allow(non_camel_case_types)]
+#[repr(C)]
+pub struct iovec {
+    iov_base: *mut c_void, // starting address
+    iov_len: size_t,       // number of bytes to transfer
+}
 
 use crate::codec::Decoder;
+use crate::connection::ConnectionStats;
 use crate::error::Error;
 use crate::h3::connection::Http3Connection;
 use crate::h3::connection::Http3Priority;
@@ -57,6 +115,8 @@ use crate::h3::Http3Event;
 use crate::h3::Http3Headers;
 use crate::h3::NameValue;
 use crate::qlog::events;
+use crate::tls::SslCtx;
+use crate::tls::TlsConfig;
 use crate::Config;
 use crate::Connection;
 use crate::Endpoint;
@@ -70,19 +130,38 @@ pub extern "C" fn quic_version_is_supported(version: u32) -> bool {
     crate::version_is_supported(version)
 }
 
-struct Logger {
-    cb: extern "C" fn(line: *const u8, argp: *mut c_void),
+struct LogWriter {
+    cb: extern "C" fn(data: *const u8, data_len: size_t, argp: *mut c_void),
     argp: std::sync::atomic::AtomicPtr<c_void>,
 }
 
-impl log::Log for Logger {
+impl Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (self.cb)(
+            buf.as_ptr(),
+            buf.len(),
+            self.argp.load(atomic::Ordering::Relaxed),
+        );
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl log::Log for LogWriter {
     fn enabled(&self, _metadata: &log::Metadata) -> bool {
         true
     }
 
     fn log(&self, record: &log::Record) {
-        let line = format!("{}: {}\0", record.target(), record.args());
-        (self.cb)(line.as_ptr(), self.argp.load(atomic::Ordering::Relaxed));
+        let line = format!("{}: {}\n", record.target(), record.args());
+        (self.cb)(
+            line.as_ptr(),
+            line.len(),
+            self.argp.load(atomic::Ordering::Relaxed),
+        );
     }
 
     fn flush(&self) {}
@@ -126,10 +205,16 @@ pub extern "C" fn quic_config_set_recv_udp_payload_size(config: &mut Config, v: 
     config.set_recv_udp_payload_size(v);
 }
 
-/// Set the maximum outgoing UDP payload size.
-/// This is depended on both the configured max payload size and the max_udp_payload_size
-/// transport parameter advertised by the remote peer.
-/// The default and minimum value is `1200`.
+/// Enable the Datagram Packetization Layer Path MTU Discovery
+/// default value is true.
+#[no_mangle]
+pub extern "C" fn enable_dplpmtud(config: &mut Config, v: bool) {
+    config.enable_dplpmtud(v);
+}
+
+/// Set the maximum outgoing UDP payload size in bytes.
+/// It corresponds to the maximum datagram size that DPLPMTUD tries to discovery.
+/// The default value is `1200` which means let DPLPMTUD choose a value.
 #[no_mangle]
 pub extern "C" fn quic_config_set_send_udp_payload_size(config: &mut Config, v: usize) {
     config.set_send_udp_payload_size(v);
@@ -137,24 +222,32 @@ pub extern "C" fn quic_config_set_send_udp_payload_size(config: &mut Config, v: 
 
 /// Set the `initial_max_data` transport parameter. It means the initial
 /// value for the maximum amount of data that can be sent on the connection.
+/// The value is capped by the setting `max_connection_window`.
+/// The default value is `10485760`.
 #[no_mangle]
 pub extern "C" fn quic_config_set_initial_max_data(config: &mut Config, v: u64) {
     config.set_initial_max_data(v);
 }
 
 /// Set the `initial_max_stream_data_bidi_local` transport parameter.
+/// The value is capped by the setting `max_stream_window`.
+/// The default value is `5242880`.
 #[no_mangle]
 pub extern "C" fn quic_config_set_initial_max_stream_data_bidi_local(config: &mut Config, v: u64) {
     config.set_initial_max_stream_data_bidi_local(v);
 }
 
 /// Set the `initial_max_stream_data_bidi_remote` transport parameter.
+/// The value is capped by the setting `max_stream_window`.
+/// The default value is `2097152`.
 #[no_mangle]
 pub extern "C" fn quic_config_set_initial_max_stream_data_bidi_remote(config: &mut Config, v: u64) {
     config.set_initial_max_stream_data_bidi_remote(v);
 }
 
 /// Set the `initial_max_stream_data_uni` transport parameter.
+/// The value is capped by the setting `max_stream_window`.
+/// The default value is `1048576`.
 #[no_mangle]
 pub extern "C" fn quic_config_set_initial_max_stream_data_uni(config: &mut Config, v: u64) {
     config.set_initial_max_stream_data_uni(v);
@@ -207,12 +300,86 @@ pub extern "C" fn quic_config_set_min_congestion_window(config: &mut Config, v: 
     config.set_min_congestion_window(v);
 }
 
+/// Set the threshold for slow start in packets.
+/// The default value is the maximum value of u64.
+#[no_mangle]
+pub extern "C" fn quic_config_set_slow_start_thresh(config: &mut Config, v: u64) {
+    config.set_slow_start_thresh(v);
+}
+
+/// Set the minimum duration for BBR ProbeRTT state in milliseconds.
+/// The default value is 200 milliseconds.
+#[no_mangle]
+pub extern "C" fn quic_config_set_bbr_probe_rtt_duration(config: &mut Config, v: u64) {
+    config.set_bbr_probe_rtt_duration(v);
+}
+
+/// Enable using a cwnd based on bdp during ProbeRTT state.
+/// The default value is false.
+#[no_mangle]
+pub extern "C" fn quic_config_enable_bbr_probe_rtt_based_on_bdp(config: &mut Config, v: bool) {
+    config.enable_bbr_probe_rtt_based_on_bdp(v);
+}
+
+/// Set the cwnd gain for BBR ProbeRTT state.
+/// The default value is 0.75
+#[no_mangle]
+pub extern "C" fn quic_config_set_bbr_probe_rtt_cwnd_gain(config: &mut Config, v: f64) {
+    config.set_bbr_probe_rtt_cwnd_gain(v);
+}
+
+/// Set the length of the BBR RTProp min filter window in milliseconds.
+/// The default value is 10000 milliseconds.
+#[no_mangle]
+pub extern "C" fn quic_config_set_bbr_rtprop_filter_len(config: &mut Config, v: u64) {
+    config.set_bbr_rtprop_filter_len(v);
+}
+
+/// Set the cwnd gain for BBR ProbeBW state.
+/// The default value is 2.0
+#[no_mangle]
+pub extern "C" fn quic_config_set_bbr_probe_bw_cwnd_gain(config: &mut Config, v: f64) {
+    config.set_bbr_probe_bw_cwnd_gain(v);
+}
+
+/// Set the delta in copa slow start state.
+#[no_mangle]
+pub extern "C" fn quic_config_set_copa_slow_start_delta(config: &mut Config, v: f64) {
+    config.set_copa_slow_start_delta(v);
+}
+
+/// Set the delta in coap steady state.
+#[no_mangle]
+pub extern "C" fn quic_config_set_copa_steady_delta(config: &mut Config, v: f64) {
+    config.set_copa_steady_delta(v);
+}
+
+/// Enable Using the rtt standing instead of the latest rtt to calculate queueing delay.
+#[no_mangle]
+pub extern "C" fn quic_config_enable_copa_use_standing_rtt(config: &mut Config, v: bool) {
+    config.enable_copa_use_standing_rtt(v);
+}
+
 /// Set the initial RTT in milliseconds. The default value is 333ms.
 /// The configuration should be changed with caution. Setting a value less than the default
 /// will cause retransmission of handshake packets to be more aggressive.
 #[no_mangle]
 pub extern "C" fn quic_config_set_initial_rtt(config: &mut Config, v: u64) {
     config.set_initial_rtt(v);
+}
+
+/// Enable pacing to smooth the flow of packets sent onto the network.
+/// The default value is true.
+#[no_mangle]
+pub extern "C" fn quic_config_enable_pacing(config: &mut Config, v: bool) {
+    config.enable_pacing(v);
+}
+
+/// Set clock granularity used by the pacer.
+/// The default value is 10 milliseconds.
+#[no_mangle]
+pub extern "C" fn quic_config_set_pacing_granularity(config: &mut Config, v: u64) {
+    config.set_pacing_granularity(v);
 }
 
 /// Set the linear factor for calculating the probe timeout.
@@ -240,13 +407,30 @@ pub extern "C" fn quic_config_set_active_connection_id_limit(config: &mut Config
     config.set_active_connection_id_limit(v);
 }
 
+/// Set the `enable_multipath` transport parameter.
+/// The default value is false. (Experimental)
+#[no_mangle]
+pub extern "C" fn quic_config_enable_multipath(config: &mut Config, enabled: bool) {
+    config.enable_multipath(enabled);
+}
+
+/// Set the multipath scheduling algorithm
+/// The default value is MultipathAlgorithm::MinRtt
+#[no_mangle]
+pub extern "C" fn quic_config_set_multipath_algorithm(config: &mut Config, v: MultipathAlgorithm) {
+    config.set_multipath_algorithm(v);
+}
+
 /// Set the maximum size of the connection flow control window.
+/// The default value is MAX_CONNECTION_WINDOW (15 MB).
 #[no_mangle]
 pub extern "C" fn quic_config_set_max_connection_window(config: &mut Config, v: u64) {
     config.set_max_connection_window(v);
 }
 
 /// Set the maximum size of the stream flow control window.
+/// The value should not be greater than the setting `max_connection_window`.
+/// The default value is MAX_STREAM_WINDOW (6 MB).
 #[no_mangle]
 pub extern "C" fn quic_config_set_max_stream_window(config: &mut Config, v: u64) {
     config.set_max_stream_window(v);
@@ -260,6 +444,7 @@ pub extern "C" fn quic_config_set_max_concurrent_conns(config: &mut Config, v: u
 
 /// Set the key for reset token generation. The token_key_len should be not less
 /// than 64.
+/// Applicable to Server only.
 #[no_mangle]
 pub extern "C" fn quic_config_set_reset_token_key(
     config: &mut Config,
@@ -279,20 +464,16 @@ pub extern "C" fn quic_config_set_reset_token_key(
     0
 }
 
-/// Set whether stateless reset is allowed.
-#[no_mangle]
-pub extern "C" fn quic_config_enable_stateless_reset(config: &mut Config, enabled: bool) {
-    config.enable_stateless_reset(enabled);
-}
-
 /// Set the lifetime of address token.
+/// Applicable to Server only.
 #[no_mangle]
 pub extern "C" fn quic_config_set_address_token_lifetime(config: &mut Config, seconds: u64) {
     config.set_address_token_lifetime(seconds);
 }
 
-/// Set the key for address token generation.
+/// Set the key for address token generation. It also enables retry.
 /// The token_key_len should be a multiple of 16.
+/// Applicable to Server only.
 #[no_mangle]
 pub extern "C" fn quic_config_set_address_token_key(
     config: &mut Config,
@@ -321,21 +502,281 @@ pub extern "C" fn quic_config_set_address_token_key(
 }
 
 /// Set whether stateless retry is allowed. Default is not allowed.
+/// Applicable to Server only.
 #[no_mangle]
 pub extern "C" fn quic_config_enable_retry(config: &mut Config, enabled: bool) {
     config.enable_retry(enabled);
 }
 
+/// Set whether stateless reset is allowed.
+/// Applicable to Endpoint only.
+#[no_mangle]
+pub extern "C" fn quic_config_enable_stateless_reset(config: &mut Config, enabled: bool) {
+    config.enable_stateless_reset(enabled);
+}
+
 /// Set the length of source cid. The length should not be greater than 20.
+/// Applicable to Endpoint only.
 #[no_mangle]
 pub extern "C" fn quic_config_set_cid_len(config: &mut Config, v: u8) {
     config.set_cid_len(v as usize);
 }
 
+/// Set the anti-amplification factor.
+///
+/// The server limits the data sent to an unvalidated address to
+/// `anti_amplification_factor` times the received data.
+#[no_mangle]
+pub extern "C" fn quic_config_set_anti_amplification_factor(config: &mut Config, v: u8) {
+    config.set_anti_amplification_factor(v as usize);
+}
+
 /// Set the batch size for sending packets.
+/// Applicable to Endpoint only.
 #[no_mangle]
 pub extern "C" fn quic_config_set_send_batch_size(config: &mut Config, v: u16) {
     config.set_send_batch_size(v as usize);
+}
+
+/// Set the buffer size for disordered zerortt packets on the server.
+/// The default value is `1000`. A value of 0 will be treated as default value.
+/// Applicable to Server only.
+#[no_mangle]
+pub extern "C" fn quic_config_set_zerortt_buffer_size(config: &mut Config, v: u16) {
+    config.set_zerortt_buffer_size(v as usize);
+}
+
+/// Set the maximum number of undecryptable packets that can be stored by one connection.
+/// The default value is `10`. A value of 0 will be treated as default value.
+#[no_mangle]
+pub extern "C" fn quic_config_set_max_undecryptable_packets(config: &mut Config, v: u16) {
+    config.set_max_undecryptable_packets(v as usize);
+}
+
+/// Enable or disable encryption on 1-RTT packets. (Experimental)
+/// The default value is true.
+/// WARN: The The disable_1rtt_encryption extension is not meant to be used
+/// for any practical application protocol on the open internet.
+#[no_mangle]
+pub extern "C" fn quic_config_enable_encryption(config: &mut Config, v: bool) {
+    config.enable_encryption(v);
+}
+
+/// Create a new TlsConfig.
+/// The caller is responsible for the memory of the TlsConfig and should properly
+/// destroy it by calling `quic_tls_config_free`.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_new() -> *mut TlsConfig {
+    match TlsConfig::new() {
+        Ok(tls_config) => Box::into_raw(Box::new(tls_config)),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Create a new TlsConfig with SSL_CTX.
+/// When using raw SSL_CTX, TlsSession::session() and TlsSession::set_keylog() won't take effect.
+/// The caller is responsible for the memory of TlsConfig and SSL_CTX when use this function.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_new_with_ssl_ctx(ssl_ctx: *mut SslCtx) -> *mut TlsConfig {
+    Box::into_raw(Box::new(TlsConfig::new_with_ssl_ctx(ssl_ctx)))
+}
+
+fn convert_application_protos(protos: *const *const c_char, proto_num: isize) -> Vec<Vec<u8>> {
+    let mut application_protos = vec![];
+    for i in 0..proto_num {
+        let proto = unsafe { (*protos).offset(i) };
+        if proto.is_null() {
+            continue;
+        }
+
+        let proto = unsafe { ffi::CStr::from_ptr(proto).to_bytes().to_vec() };
+        application_protos.push(proto);
+    }
+
+    application_protos
+}
+
+/// Create a new client side TlsConfig.
+/// The caller is responsible for the memory of the TlsConfig and should properly
+/// destroy it by calling `quic_tls_config_free`.
+/// For more information about `protos`, please see `quic_tls_config_set_application_protos`.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_new_client_config(
+    protos: *const *const c_char,
+    proto_num: isize,
+    enable_early_data: bool,
+) -> *mut TlsConfig {
+    if protos.is_null() {
+        return ptr::null_mut();
+    }
+
+    let application_protos = convert_application_protos(protos, proto_num);
+    match TlsConfig::new_client_config(application_protos, enable_early_data) {
+        Ok(tls_config) => Box::into_raw(Box::new(tls_config)),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Create a new server side TlsConfig.
+/// The caller is responsible for the memory of the TlsConfig and should properly
+/// destroy it by calling `quic_tls_config_free`.
+/// For more information about `protos`, please see `quic_tls_config_set_application_protos`.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_new_server_config(
+    cert_file: *const c_char,
+    key_file: *const c_char,
+    protos: *const *const c_char,
+    proto_num: isize,
+    enable_early_data: bool,
+) -> *mut TlsConfig {
+    if cert_file.is_null() || key_file.is_null() || protos.is_null() {
+        return ptr::null_mut();
+    }
+
+    let application_protos = convert_application_protos(protos, proto_num);
+    let cert_file = unsafe {
+        match ffi::CStr::from_ptr(cert_file).to_str() {
+            Ok(cert_file) => cert_file,
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+    let key_file = unsafe {
+        match ffi::CStr::from_ptr(key_file).to_str() {
+            Ok(key_file) => key_file,
+            Err(_) => return ptr::null_mut(),
+        }
+    };
+    match TlsConfig::new_server_config(cert_file, key_file, application_protos, enable_early_data) {
+        Ok(tls_config) => Box::into_raw(Box::new(tls_config)),
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+/// Destroy a TlsConfig instance.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_free(tls_config: *mut TlsConfig) {
+    unsafe {
+        let _ = Box::from_raw(tls_config);
+    };
+}
+
+/// Set whether early data is allowed.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_early_data_enabled(tls_config: &mut TlsConfig, enable: bool) {
+    tls_config.set_early_data_enabled(enable)
+}
+
+/// Set the session lifetime in seconds
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_session_timeout(tls_config: &mut TlsConfig, timeout: u32) {
+    tls_config.set_session_timeout(timeout)
+}
+
+/// Set the list of supported application protocols.
+/// The `protos` is a pointer that points to an array, where each element of the array is a string
+/// pointer representing an application protocol identifier. For example, you can define it as
+/// follows: const char* const protos[2] = {"h3", "http/0.9"}.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_application_protos(
+    tls_config: &mut TlsConfig,
+    protos: *const *const c_char,
+    proto_num: isize,
+) -> c_int {
+    if protos.is_null() {
+        return -1;
+    }
+
+    let application_protos = convert_application_protos(protos, proto_num);
+    match tls_config.set_application_protos(application_protos) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Set session ticket key for server.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_ticket_key(
+    tls_config: &mut TlsConfig,
+    ticket_key: *const u8,
+    ticket_key_len: size_t,
+) -> c_int {
+    let ticket_key = unsafe { slice::from_raw_parts(ticket_key, ticket_key_len) };
+    match tls_config.set_ticket_key(ticket_key) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Set the certificate verification behavior.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_verify(tls_config: &mut TlsConfig, verify: bool) {
+    tls_config.set_verify(verify)
+}
+
+/// Set the PEM-encoded certificate file.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_certificate_file(
+    tls_config: &mut TlsConfig,
+    cert_file: *const c_char,
+) -> c_int {
+    if cert_file.is_null() {
+        return -1;
+    }
+
+    let cert_file = unsafe {
+        match ffi::CStr::from_ptr(cert_file).to_str() {
+            Ok(cert_file) => cert_file,
+            Err(_) => return -1,
+        }
+    };
+    match tls_config.set_certificate_file(cert_file) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Set the PEM-encoded private key file.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_private_key_file(
+    tls_config: &mut TlsConfig,
+    key_file: *const c_char,
+) -> c_int {
+    if key_file.is_null() {
+        return -1;
+    }
+
+    let key_file = unsafe {
+        match ffi::CStr::from_ptr(key_file).to_str() {
+            Ok(key_file) => key_file,
+            Err(_) => return -1,
+        }
+    };
+    match tls_config.set_private_key_file(key_file) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Set CA certificates.
+#[no_mangle]
+pub extern "C" fn quic_tls_config_set_ca_certs(
+    tls_config: &mut TlsConfig,
+    ca_path: *const c_char,
+) -> c_int {
+    if ca_path.is_null() {
+        return -1;
+    }
+
+    let ca_path = unsafe {
+        match ffi::CStr::from_ptr(ca_path).to_str() {
+            Ok(ca_path) => ca_path,
+            Err(_) => return -1,
+        }
+    };
+    match tls_config.set_ca_certs(ca_path) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
 }
 
 /// Set TLS config selector.
@@ -350,13 +791,17 @@ pub extern "C" fn quic_config_set_tls_selector(
 }
 
 /// Set TLS config.
-/// The caller is responsible for the memory of SSL_CTX when use this function.
+///
+/// Note: Config doesn't own the TlsConfig when using this function.
+/// It is the responsibility of the caller to release it.
 #[no_mangle]
-pub extern "C" fn quic_config_set_tls_config(
-    config: &mut Config,
-    ssl_ctx: *mut crate::tls::SslCtx,
-) {
-    let tls_config = crate::tls::TlsConfig::new_with_ssl_ctx(ssl_ctx);
+pub extern "C" fn quic_config_set_tls_config(config: &mut Config, tls_config: *mut TlsConfig) {
+    if tls_config.is_null() {
+        return;
+    }
+
+    let tls_config = unsafe { tls_config.as_mut().unwrap() };
+    let tls_config = TlsConfig::new_with_ssl_ctx(tls_config.ssl_ctx());
     config.set_tls_config(tls_config);
 }
 
@@ -387,7 +832,7 @@ pub extern "C" fn quic_endpoint_new(
         context: sender_ctx,
     });
     let e = Endpoint::new(config.clone(), is_server, handler, sender);
-    Box::into_raw(config);
+    let _ = Box::into_raw(config);
     Box::into_raw(Box::new(e))
 }
 
@@ -399,8 +844,24 @@ pub extern "C" fn quic_endpoint_free(endpoint: *mut Endpoint) {
     };
 }
 
+/// Set the connection id generator for the endpoint.
+/// By default, the random connection id generator is used.
+#[no_mangle]
+pub extern "C" fn quic_endpoint_set_cid_generator(
+    endpoint: &mut Endpoint,
+    cid_gen_methods: *const ConnectionIdGeneratorMethods,
+    cid_gen_ctx: ConnectionIdGeneratorContext,
+) {
+    let cid_generator = Box::new(ConnectionIdGenerator {
+        methods: cid_gen_methods,
+        context: cid_gen_ctx,
+    });
+    endpoint.set_cid_generator(cid_generator);
+}
+
 /// Create a client connection.
 /// If success, the output parameter `index` carrys the index of the connection.
+/// Note: The `config` specific to the endpoint or server is irrelevant and will be disregarded.
 #[no_mangle]
 pub extern "C" fn quic_endpoint_connect(
     endpoint: &mut Endpoint,
@@ -413,6 +874,7 @@ pub extern "C" fn quic_endpoint_connect(
     session_len: size_t,
     token: *const u8,
     token_len: size_t,
+    config: *const Config,
     index: *mut u64,
 ) -> c_int {
     let local = sock_addr_from_c(local, local_len);
@@ -438,8 +900,13 @@ pub extern "C" fn quic_endpoint_connect(
     } else {
         None
     };
+    let config = if !config.is_null() {
+        Some(unsafe { &(*config) })
+    } else {
+        None
+    };
 
-    match endpoint.connect(local, remote, server_name, session, token) {
+    match endpoint.connect(local, remote, server_name, session, token, config) {
         Ok(idx) => {
             if !index.is_null() {
                 unsafe {
@@ -474,7 +941,7 @@ pub extern "C" fn quic_endpoint_recv(
 pub extern "C" fn quic_endpoint_timeout(endpoint: &Endpoint) -> u64 {
     match endpoint.timeout() {
         Some(v) => v.as_millis() as u64,
-        None => std::u64::MAX,
+        None => u64::MAX,
     }
 }
 
@@ -607,6 +1074,57 @@ pub extern "C" fn quic_conn_session(
     }
 }
 
+/// Return details why 0-RTT was accepted or rejected.
+#[no_mangle]
+pub extern "C" fn quic_conn_early_data_reason(
+    conn: &mut Connection,
+    out: &mut *const u8,
+    out_len: &mut size_t,
+) -> c_int {
+    match conn.early_data_reason() {
+        Ok(reason) => {
+            match reason {
+                Some(reason) => {
+                    *out = reason.as_ptr();
+                    *out_len = reason.len();
+                }
+                None => *out_len = 0,
+            }
+            0
+        }
+        Err(e) => e.to_errno() as i32,
+    }
+}
+
+/// Send a Ping frame on the active path(s) for keep-alive.
+#[no_mangle]
+pub extern "C" fn quic_conn_ping(conn: &mut Connection) -> c_int {
+    match conn.ping(None) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Send a Ping frame on the specified path for keep-alive.
+/// The API is only applicable to multipath quic connections.
+#[no_mangle]
+pub extern "C" fn quic_conn_ping_path(
+    conn: &mut Connection,
+    local: &sockaddr,
+    local_len: socklen_t,
+    remote: &sockaddr,
+    remote_len: socklen_t,
+) -> c_int {
+    let addr = FourTuple {
+        local: sock_addr_from_c(local, local_len),
+        remote: sock_addr_from_c(remote, remote_len),
+    };
+    match conn.ping(Some(addr)) {
+        Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
 /// Add a new path on the client connection.
 #[no_mangle]
 pub extern "C" fn quic_conn_add_path(
@@ -715,6 +1233,29 @@ pub extern "C" fn quic_conn_active_path(conn: &Connection, a: &mut PathAddress) 
     false
 }
 
+/// Return the latest statistics about the specified path.
+#[no_mangle]
+pub extern "C" fn quic_conn_path_stats<'a>(
+    conn: &'a mut Connection,
+    local: &sockaddr,
+    local_len: socklen_t,
+    remote: &sockaddr,
+    remote_len: socklen_t,
+) -> Option<&'a PathStats> {
+    let local_addr = sock_addr_from_c(local, local_len);
+    let remote_addr = sock_addr_from_c(remote, remote_len);
+    if let Ok(stats) = conn.get_path_stats(local_addr, remote_addr) {
+        return Some(stats);
+    }
+    None
+}
+
+/// Return statistics about the connection.
+#[no_mangle]
+pub extern "C" fn quic_conn_stats(conn: &mut Connection) -> &ConnectionStats {
+    conn.stats()
+}
+
 /// Return the trace id of the connection
 #[no_mangle]
 pub extern "C" fn quic_conn_trace_id(
@@ -735,8 +1276,20 @@ pub extern "C" fn quic_conn_is_draining(conn: &mut Connection) -> bool {
 
 /// Check whether the connection is closing.
 #[no_mangle]
+pub extern "C" fn quic_conn_is_closing(conn: &mut Connection) -> bool {
+    conn.is_closing()
+}
+
+/// Check whether the connection is closed.
+#[no_mangle]
 pub extern "C" fn quic_conn_is_closed(conn: &mut Connection) -> bool {
     conn.is_closed()
+}
+
+/// Check whether the connection was closed due to handshake timeout.
+#[no_mangle]
+pub extern "C" fn quic_conn_is_handshake_timeout(conn: &mut Connection) -> bool {
+    conn.is_handshake_timeout()
 }
 
 /// Check whether the connection was closed due to idle timeout.
@@ -808,16 +1361,58 @@ pub extern "C" fn quic_conn_context(conn: &mut Connection) -> *mut c_void {
     }
 }
 
-/// Set keylog file
+/// Set the callback of keylog output.
+/// `cb` is a callback function that will be called for each keylog.
+/// `data` is a keylog message and `argp` is user-defined data that will be passed to the callback.
 #[no_mangle]
+pub extern "C" fn quic_conn_set_keylog(
+    conn: &mut Connection,
+    cb: extern "C" fn(data: *const u8, data_len: size_t, argp: *mut c_void),
+    argp: *mut c_void,
+) {
+    let argp = atomic::AtomicPtr::new(argp);
+    let writer = Box::new(LogWriter { cb, argp });
+    conn.set_keylog(Box::new(writer));
+}
+
+/// Set keylog file.
+/// Note: The API is not applicable for Windows.
+#[no_mangle]
+#[cfg(unix)]
 pub extern "C" fn quic_conn_set_keylog_fd(conn: &mut Connection, fd: c_int) {
     let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let writer = std::io::BufWriter::new(file);
     conn.set_keylog(Box::new(writer));
 }
 
-/// Set qlog file
+/// Set the callback of qlog output.
+/// `cb` is a callback function that will be called for each qlog.
+/// `data` is a qlog message and `argp` is user-defined data that will be passed to the callback.
+/// `title` and `desc` respectively refer to the "title" and "description" sections of qlog.
 #[no_mangle]
+pub extern "C" fn quic_conn_set_qlog(
+    conn: &mut Connection,
+    cb: extern "C" fn(data: *const u8, data_len: size_t, argp: *mut c_void),
+    argp: *mut c_void,
+    title: *const c_char,
+    desc: *const c_char,
+) {
+    let argp = atomic::AtomicPtr::new(argp);
+    let writer = Box::new(LogWriter { cb, argp });
+    let title = unsafe { ffi::CStr::from_ptr(title).to_str().unwrap() };
+    let description = unsafe { ffi::CStr::from_ptr(desc).to_str().unwrap() };
+
+    conn.set_qlog(
+        Box::new(writer),
+        title.to_string(),
+        format!("{} id={}", description, conn.trace_id()),
+    );
+}
+
+/// Set qlog file.
+/// Note: The API is not applicable for Windows.
+#[no_mangle]
+#[cfg(unix)]
 pub extern "C" fn quic_conn_set_qlog_fd(
     conn: &mut Connection,
     fd: c_int,
@@ -909,7 +1504,10 @@ pub extern "C" fn quic_stream_write(
     }
 }
 
-/// Create a new quic transport stream with the given id and priority.
+/// Create a new quic stream with the given id and priority.
+/// This is a low-level API for stream creation. It is recommended to use
+/// `quic_stream_bidi_new` for bidirectional streams or `quic_stream_uni_new`
+/// for unidrectional streams.
 #[no_mangle]
 pub extern "C" fn quic_stream_new(
     conn: &mut Connection,
@@ -919,6 +1517,42 @@ pub extern "C" fn quic_stream_new(
 ) -> c_int {
     match conn.stream_new(stream_id, urgency, incremental) {
         Ok(_) => 0,
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Create a new quic bidiectional stream with the given priority.
+/// If success, the output parameter `stream_id` carrys the id of the created stream.
+#[no_mangle]
+pub extern "C" fn quic_stream_bidi_new(
+    conn: &mut Connection,
+    urgency: u8,
+    incremental: bool,
+    stream_id: &mut u64,
+) -> c_int {
+    match conn.stream_bidi_new(urgency, incremental) {
+        Ok(id) => {
+            *stream_id = id;
+            0
+        }
+        Err(e) => e.to_errno() as c_int,
+    }
+}
+
+/// Create a new quic uniectional stream with the given priority.
+/// If success, the output parameter `stream_id` carrys the id of the created stream.
+#[no_mangle]
+pub extern "C" fn quic_stream_uni_new(
+    conn: &mut Connection,
+    urgency: u8,
+    incremental: bool,
+    stream_id: &mut u64,
+) -> c_int {
+    match conn.stream_uni_new(urgency, incremental) {
+        Ok(id) => {
+            *stream_id = id;
+            0
+        }
         Err(e) => e.to_errno() as c_int,
     }
 }
@@ -999,12 +1633,9 @@ pub struct TlsConfigSelectorContext(*mut c_void);
 
 #[repr(C)]
 pub struct TlsConfigSelectMethods {
-    pub get_default: fn(ctx: *mut c_void) -> *mut crate::tls::SslCtx,
-    pub select: fn(
-        ctx: *mut c_void,
-        server_name: *const u8,
-        server_name_len: size_t,
-    ) -> *mut crate::tls::SslCtx,
+    pub get_default: fn(ctx: *mut c_void) -> *mut TlsConfig,
+    pub select:
+        fn(ctx: *mut c_void, server_name: *const u8, server_name_len: size_t) -> *mut TlsConfig,
 }
 
 #[repr(C)]
@@ -1017,29 +1648,31 @@ unsafe impl Send for TlsConfigSelector {}
 unsafe impl Sync for TlsConfigSelector {}
 
 impl crate::tls::TlsConfigSelector for TlsConfigSelector {
-    fn get_default(&self) -> Option<Arc<crate::tls::TlsConfig>> {
-        let ssl_ctx = unsafe { ((*self.methods).get_default)(self.context.0) };
-        if ssl_ctx.is_null() {
+    fn get_default(&self) -> Option<Arc<TlsConfig>> {
+        let tls_config = unsafe { ((*self.methods).get_default)(self.context.0) };
+        if tls_config.is_null() {
             return None;
         }
 
-        let tls_config = Arc::new(crate::tls::TlsConfig::new_with_ssl_ctx(ssl_ctx));
+        let tls_config = unsafe { tls_config.as_mut().unwrap() };
+        let tls_config = Arc::new(TlsConfig::new_with_ssl_ctx(tls_config.ssl_ctx()));
         Some(tls_config)
     }
 
-    fn select(&self, server_name: &str) -> Option<Arc<crate::tls::TlsConfig>> {
-        let ssl_ctx = unsafe {
+    fn select(&self, server_name: &str) -> Option<Arc<TlsConfig>> {
+        let tls_config = unsafe {
             ((*self.methods).select)(
                 self.context.0,
                 server_name.as_ptr(),
                 server_name.len() as size_t,
             )
         };
-        if ssl_ctx.is_null() {
+        if tls_config.is_null() {
             return None;
         }
 
-        let tls_config = Arc::new(crate::tls::TlsConfig::new_with_ssl_ctx(ssl_ctx));
+        let tls_config = unsafe { tls_config.as_mut().unwrap() };
+        let tls_config = Arc::new(TlsConfig::new_with_ssl_ctx(tls_config.ssl_ctx()));
         Some(tls_config)
     }
 }
@@ -1181,6 +1814,7 @@ pub struct PacketSendHandler {
 }
 
 impl crate::PacketSendHandler for PacketSendHandler {
+    #[allow(clippy::comparison_chain)]
     fn on_packets_send(&self, pkts: &[(Vec<u8>, crate::PacketInfo)]) -> Result<usize> {
         let mut pkt_specs: Vec<PacketOutSpec> = Vec::with_capacity(pkts.len());
         let mut iovecs: Vec<iovec> = Vec::with_capacity(pkts.len());
@@ -1237,16 +1871,34 @@ fn sock_addr_from_c(addr: &sockaddr, addr_len: socklen_t) -> SocketAddr {
         AF_INET => {
             assert!(addr_len as usize == std::mem::size_of::<sockaddr_in>());
             let in4 = unsafe { *(addr as *const _ as *const sockaddr_in) };
+
+            #[cfg(not(windows))]
             let addr = Ipv4Addr::from(u32::from_be(in4.sin_addr.s_addr));
+            #[cfg(windows)]
+            let addr = {
+                let ip = unsafe { in4.sin_addr.S_un.S_un_b() };
+                Ipv4Addr::from([ip.s_b1, ip.s_b2, ip.s_b3, ip.s_b4])
+            };
+
             let port = u16::from_be(in4.sin_port);
             SocketAddrV4::new(addr, port).into()
         }
         AF_INET6 => {
             assert!(addr_len as usize == std::mem::size_of::<sockaddr_in6>());
             let in6 = unsafe { *(addr as *const _ as *const sockaddr_in6) };
+
+            #[cfg(not(windows))]
             let addr = Ipv6Addr::from(in6.sin6_addr.s6_addr);
+            #[cfg(windows)]
+            let addr = Ipv6Addr::from(*unsafe { in6.sin6_addr.u.Byte() });
+
             let port = u16::from_be(in6.sin6_port);
+
+            #[cfg(not(windows))]
             let scope_id = in6.sin6_scope_id;
+            #[cfg(windows)]
+            let scope_id = unsafe { *in6.u.sin6_scope_id() };
+
             SocketAddrV6::new(addr, port, in6.sin6_flowinfo, scope_id).into()
         }
         _ => unimplemented!("unsupported address type"),
@@ -1260,13 +1912,21 @@ fn sock_addr_to_c(addr: &SocketAddr, out: &mut sockaddr_storage) -> socklen_t {
         SocketAddr::V4(addr) => unsafe {
             let sa_len = std::mem::size_of::<sockaddr_in>();
             let out_in = out as *mut _ as *mut sockaddr_in;
-            let sin_addr = in_addr {
-                s_addr: u32::from_ne_bytes(addr.ip().octets()),
+            let s_addr = u32::from_ne_bytes(addr.ip().octets());
+
+            #[cfg(not(windows))]
+            let sin_addr = in_addr { s_addr };
+            #[cfg(windows)]
+            let sin_addr = {
+                let mut s_un = std::mem::zeroed::<in_addr_S_un>();
+                *s_un.S_addr_mut() = s_addr;
+                in_addr { S_un: s_un }
             };
+
             *out_in = sockaddr_in {
                 sin_family: AF_INET as sa_family_t,
                 sin_addr,
-                #[cfg(any(target_os = "macos", target_os = "ios",))]
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
                 sin_len: sa_len as u8,
                 sin_port,
                 sin_zero: std::mem::zeroed(),
@@ -1277,24 +1937,44 @@ fn sock_addr_to_c(addr: &SocketAddr, out: &mut sockaddr_storage) -> socklen_t {
         SocketAddr::V6(addr) => unsafe {
             let sa_len = std::mem::size_of::<sockaddr_in6>();
             let out_in6 = out as *mut _ as *mut sockaddr_in6;
+
+            #[cfg(not(windows))]
             let sin6_addr = in6_addr {
                 s6_addr: addr.ip().octets(),
             };
+            #[cfg(windows)]
+            let sin6_addr = {
+                let mut u = std::mem::zeroed::<in6_addr_u>();
+                *u.Byte_mut() = addr.ip().octets();
+                in6_addr { u }
+            };
+
+            #[cfg(windows)]
+            let u = {
+                let mut u = std::mem::zeroed::<SOCKADDR_IN6_LH_u>();
+                *u.sin6_scope_id_mut() = addr.scope_id();
+                u
+            };
+
             *out_in6 = sockaddr_in6 {
                 sin6_family: AF_INET6 as sa_family_t,
                 sin6_addr,
-                #[cfg(any(target_os = "macos", target_os = "ios",))]
+                #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
                 sin6_len: sa_len as u8,
                 sin6_port: sin_port,
                 sin6_flowinfo: addr.flowinfo(),
+
+                #[cfg(not(windows))]
                 sin6_scope_id: addr.scope_id(),
+                #[cfg(windows)]
+                u,
             };
             sa_len as socklen_t
         },
     }
 }
 
-/// Meta information of a incoming packet.
+/// Meta information of an incoming packet.
 #[repr(C)]
 pub struct PacketInfo<'a> {
     src: &'a sockaddr,
@@ -1313,7 +1993,7 @@ impl<'a> From<&PacketInfo<'a>> for crate::PacketInfo {
     }
 }
 
-/// Data and meta information of a outgoing packet.
+/// Data and meta information of an outgoing packet.
 #[repr(C)]
 pub struct PacketOutSpec {
     iov: *const iovec,
@@ -1322,6 +2002,62 @@ pub struct PacketOutSpec {
     src_addr_len: socklen_t,
     dst_addr: *const c_void,
     dst_addr_len: socklen_t,
+}
+
+#[repr(C)]
+pub struct ConnectionIdGeneratorMethods {
+    /// Generate a new CID
+    pub generate: fn(gctx: *mut c_void) -> ConnectionId,
+
+    /// Return the length of a CID
+    pub cid_len: fn(gctx: *mut c_void) -> u8,
+}
+
+#[repr(transparent)]
+pub struct ConnectionIdGeneratorContext(*mut c_void);
+
+/// cbindgen:no-export
+#[repr(C)]
+pub struct ConnectionIdGenerator {
+    pub methods: *const ConnectionIdGeneratorMethods,
+    pub context: ConnectionIdGeneratorContext,
+}
+
+impl crate::ConnectionIdGenerator for ConnectionIdGenerator {
+    /// Generate a new CID
+    fn generate(&mut self) -> ConnectionId {
+        unsafe { ((*self.methods).generate)(self.context.0) }
+    }
+
+    /// Return the length of a CID
+    fn cid_len(&self) -> usize {
+        let cid_len = unsafe { ((*self.methods).cid_len)(self.context.0) };
+        cid_len as usize
+    }
+}
+
+/// Extract the header form, version and destination connection id from the
+/// QUIC packet.
+#[no_mangle]
+pub extern "C" fn quic_packet_header_info(
+    buf: *mut u8,
+    buf_len: size_t,
+    dcid_len: u8,
+    long_header: &mut bool,
+    version: &mut u32,
+    dcid: &mut ConnectionId,
+) -> c_int {
+    let buf = unsafe { slice::from_raw_parts_mut(buf, buf_len) };
+
+    match crate::PacketHeader::header_info(buf, dcid_len as usize) {
+        Ok((long, ver, cid)) => {
+            *long_header = long;
+            *version = ver;
+            *dcid = cid;
+            0
+        }
+        Err(e) => e.to_errno() as i32,
+    }
 }
 
 /// Create default config for HTTP3.
@@ -1565,7 +2301,7 @@ pub extern "C" fn http3_send_body(
     body_len: size_t,
     fin: bool,
 ) -> ssize_t {
-    if body_len > <ssize_t>::max_value() as usize {
+    if body_len > <ssize_t>::MAX as usize {
         panic!("The provided buffer is too large");
     }
 
@@ -1585,7 +2321,7 @@ pub extern "C" fn http3_recv_body(
     out: *mut u8,
     out_len: size_t,
 ) -> ssize_t {
-    if out_len > <ssize_t>::max_value() as usize {
+    if out_len > <ssize_t>::MAX as usize {
         panic!("The provided buffer is too large");
     }
 
@@ -1598,7 +2334,6 @@ pub extern "C" fn http3_recv_body(
 
 /// Parse HTTP/3 priority data.
 #[no_mangle]
-#[cfg(feature = "sfv")]
 pub extern "C" fn http3_parse_extensible_priority(
     priority: *const u8,
     priority_len: size_t,
@@ -1674,19 +2409,25 @@ fn headers_from_ptr<'a>(ptr: *const Header, len: size_t) -> Vec<h3::HeaderRef<'a
 
 /// Set logger.
 /// `cb` is a callback function that will be called for each log message.
-/// `line` is a null-terminated log message and `argp` is user-defined data that will be passed to
-/// the callback.
-/// `level` represents the log level.
+/// `data` is a '\n' terminated log message and `argp` is user-defined data that
+/// will be passed to the callback.
+/// `level` is a case-insensitive string used for specifying the log level. Valid
+/// values are "OFF", "ERROR", "WARN", "INFO", "DEBUG", and "TRACE". If its value
+/// is NULL or invalid, the default log level is "OFF".
 #[no_mangle]
 pub extern "C" fn quic_set_logger(
-    cb: extern "C" fn(line: *const u8, argp: *mut c_void),
+    cb: extern "C" fn(data: *const u8, data_len: size_t, argp: *mut c_void),
     argp: *mut c_void,
-    level: log::LevelFilter,
+    level: *const c_char,
 ) {
     let argp = atomic::AtomicPtr::new(argp);
-    let logger = Box::new(Logger { cb, argp });
+    let logger = Box::new(LogWriter { cb, argp });
     let _ = log::set_boxed_logger(logger);
-    log::set_max_level(level);
+
+    let level = unsafe { ffi::CStr::from_ptr(level).to_str().unwrap_or_default() };
+    if let Ok(level_filter) = log::LevelFilter::from_str(level) {
+        log::set_max_level(level_filter);
+    }
 }
 
 #[repr(C)]

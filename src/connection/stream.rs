@@ -101,8 +101,9 @@ pub struct StreamMap {
     /// a STOP_SENDING frame.
     stopped: StreamIdHashMap<u64>,
 
-    /// Keep track of IDs of previously closed streams, to prevent peers from
-    /// re-creating them.
+    /// Keep track of IDs of previously closed streams. It can grow and use up a
+    /// lot of memory, so it is used only in unit tests.
+    #[cfg(test)]
     closed: StreamIdHashSet,
 
     /// Streams that peer are almost out of flow control capacity, and
@@ -131,6 +132,12 @@ pub struct StreamMap {
     /// local endpoint should issue more credit by sending a MAX_DATA
     /// frame to the peer.
     pub rx_almost_full: bool,
+
+    /// Stream id for next bidirectional stream.
+    next_stream_id_bidi: u64,
+
+    /// Stream id for next unidirectional stream.
+    next_stream_id_uni: u64,
 
     /// Peer transport parameters.
     peer_transport_params: StreamTransportParams,
@@ -163,10 +170,6 @@ impl StreamMap {
 
             flow_control: flowcontrol::FlowControl::new(
                 local_params.initial_max_data,
-                cmp::min(
-                    local_params.initial_max_data / 2 * 3,
-                    DEFAULT_CONNECTION_WINDOW,
-                ),
                 max_connection_window,
             ),
 
@@ -174,6 +177,9 @@ impl StreamMap {
 
             max_stream_window,
             rx_almost_full: false,
+
+            next_stream_id_bidi: if is_server { 1 } else { 0 },
+            next_stream_id_uni: if is_server { 3 } else { 2 },
 
             local_transport_params: local_params,
             peer_transport_params: StreamTransportParams::default(),
@@ -198,6 +204,26 @@ impl StreamMap {
         self.streams.get_mut(&id)
     }
 
+    /// Create a new bidirectional stream with given stream priority.
+    /// Return id of the created stream upon success.
+    pub fn stream_bidi_new(&mut self, urgency: u8, incremental: bool) -> Result<u64> {
+        let stream_id = self.next_stream_id_bidi;
+        match self.stream_set_priority(stream_id, urgency, incremental) {
+            Ok(_) => Ok(stream_id),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Create a new unidrectional stream with given stream priority.
+    /// Return id of the created stream upon success.
+    pub fn stream_uni_new(&mut self, urgency: u8, incremental: bool) -> Result<u64> {
+        let stream_id = self.next_stream_id_uni;
+        match self.stream_set_priority(stream_id, urgency, incremental) {
+            Ok(_) => Ok(stream_id),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Get the lowest offset of data to be read.
     pub fn stream_read_offset(&mut self, stream_id: u64) -> Option<u64> {
         match self.get_mut(stream_id) {
@@ -209,9 +235,7 @@ impl StreamMap {
     /// Read contiguous data from the stream's receive buffer into the given buffer.
     ///
     /// Return the number of bytes read and the `fin` flag if read successfully.
-    ///
     /// Return `StreamStateError` if the stream closed or never opened.
-    ///
     /// Return `Done` if the stream is not readable.
     pub fn stream_read(&mut self, stream_id: u64, out: &mut [u8]) -> Result<(usize, bool)> {
         // Local initiated unidirectional streams are send-only, so we can't read from them.
@@ -612,12 +636,19 @@ impl StreamMap {
     /// Return a mutable reference to the stream with the given ID if it exists,
     /// or create a new one with given paras otherwise if it is allowed.
     fn get_or_create(&mut self, id: u64, local: bool) -> Result<&mut Stream> {
+        // A stream ID is a 62-bit integer (0 to 2^62-1) that is unique for all
+        // streams on a connection.
+        if id > crate::codec::VINT_MAX {
+            return Err(Error::ProtocolViolation);
+        }
+
+        let closed = self.is_closed(id);
         match self.streams.entry(id) {
             // 1.Can not find any stream with the given stream ID.
             // It may not be created yet or it has been closed.
             hash_map::Entry::Vacant(v) => {
                 // Stream has already been closed and collected into `closed`.
-                if self.closed.contains(&id) {
+                if closed {
                     return Err(Error::Done);
                 }
 
@@ -656,6 +687,16 @@ impl StreamMap {
                     self.writable.insert(id);
                 }
 
+                // Update stream id for next bidirectional/unidirectional stream.
+                if bidi {
+                    self.next_stream_id_bidi = cmp::max(self.next_stream_id_bidi, id);
+                    self.next_stream_id_bidi = self.next_stream_id_bidi.saturating_add(4);
+                } else {
+                    self.next_stream_id_uni = cmp::max(self.next_stream_id_uni, id);
+                    self.next_stream_id_uni = self.next_stream_id_uni.saturating_add(4);
+                }
+
+                self.concurrency_control.remove_avail_id(id, self.is_server);
                 self.events.add(Event::StreamCreated(id));
                 Ok(v.insert(new_stream))
             }
@@ -665,10 +706,16 @@ impl StreamMap {
         }
     }
 
+    /// Return true if we should send `MAX_DATA` frame to peer to update
+    /// the connection level flow control limit.
+    pub fn need_send_max_data(&self) -> bool {
+        self.rx_almost_full && self.max_rx_data() < self.max_rx_data_next()
+    }
+
     /// Return true if need to send stream frames.
     pub fn need_send_stream_frames(&self) -> bool {
         self.has_sendable_streams()
-            || self.rx_almost_full
+            || self.need_send_max_data()
             || self.data_blocked_at().is_some()
             || self.should_send_max_streams()
             || self.has_almost_full_streams()
@@ -827,7 +874,7 @@ impl StreamMap {
     /// Note that this method does not check if the stream id is complied with
     /// the role of the endpoint.
     fn mark_closed(&mut self, stream_id: u64, local: bool) {
-        if self.closed.contains(&stream_id) {
+        if self.is_closed(stream_id) {
             return;
         }
 
@@ -844,6 +891,10 @@ impl StreamMap {
 
         self.mark_readable(stream_id, false);
         self.mark_writable(stream_id, false);
+        if let Some(stream) = self.get_mut(stream_id) {
+            stream.mark_closed();
+        }
+        #[cfg(test)]
         self.closed.insert(stream_id);
 
         if self.events.add(Event::StreamClosed(stream_id)) {
@@ -1049,9 +1100,23 @@ impl StreamMap {
         self.stopped.iter()
     }
 
-    /// Return true if the stream has been closed and collected to `closed`.
+    /// Return true if the stream has been closed.
     pub fn is_closed(&self, stream_id: u64) -> bool {
-        self.closed.contains(&stream_id)
+        // It is an existing stream
+        if let Some(stream) = self.get(stream_id) {
+            return stream.is_closed();
+        }
+
+        // It is a stream to be create
+        let is_server = self.is_server;
+        if self.concurrency_control.is_available(stream_id, is_server)
+            || self.concurrency_control.is_limited(stream_id, is_server)
+        {
+            return false;
+        }
+
+        // It is a destroyed stream
+        true
     }
 
     /// Return true if there are any streams that have buffered data to send.
@@ -1125,7 +1190,6 @@ impl StreamMap {
         // An endpoint that receives a MAX_STREAM_DATA frame for a receive-only stream
         // MUST terminate the connection with error STREAM_STATE_ERROR.
         if !is_local(stream_id, self.is_server) && !is_bidi(stream_id) {
-            // 针对StreamStateError做扩展，支持记录ID，以及首次发现异常的帧
             return Err(Error::StreamStateError);
         }
 
@@ -1277,8 +1341,17 @@ impl StreamMap {
             return Err(Error::FlowControlError);
         }
 
-        if !was_readable && stream.is_readable() {
+        let is_readable = stream.is_readable();
+        let is_complete = stream.is_complete();
+        let local = stream.local;
+
+        if !was_readable && is_readable {
             self.mark_readable(stream_id, true);
+        }
+
+        // Mark closed if the stream is complete and not readable.
+        if is_complete && !is_readable {
+            self.mark_closed(stream_id, local);
         }
 
         self.flow_control.increase_recv_off(max_rx_off_delta);
@@ -1554,7 +1627,7 @@ impl StreamMap {
     /// RESET_STREAM frame was lost, if the stream is still open, add the stream
     /// to the reset set to ensure a RESET_STREAM frame will be retransmitted.
     pub fn on_reset_stream_frame_lost(&mut self, stream_id: u64, error_code: u64, final_size: u64) {
-        if self.streams.get(&stream_id).is_some() {
+        if self.streams.contains_key(&stream_id) {
             self.mark_reset(stream_id, true, error_code, final_size);
         }
     }
@@ -1576,7 +1649,7 @@ impl StreamMap {
     /// MAX_STREAM_DATA frame was lost, add the stream to the almost full set
     /// to ensure a MAX_STREAM_DATA frame will be sent.
     pub fn on_max_stream_data_frame_lost(&mut self, stream_id: u64) {
-        if self.streams.get(&stream_id).is_some() {
+        if self.streams.contains_key(&stream_id) {
             self.mark_almost_full(stream_id, true);
         }
     }
@@ -1659,8 +1732,11 @@ enum StreamFlags {
     /// Upper layer want to read data from stream.
     WantRead = 1 << 0,
 
-    // Upper layer want to write data to stream.
+    /// Upper layer want to write data to stream.
     WantWrite = 1 << 1,
+
+    /// The stream has been closed and is waiting to release its resources.
+    Closed = 1 << 2,
 }
 
 #[derive(Default)]
@@ -1778,7 +1854,7 @@ impl Stream {
         self.recv.trace_id = trace_id.to_string();
     }
 
-    /// Return true if the stream has data to be read.
+    /// Return true if the stream has data to be read or an error to be collected.
     pub fn is_readable(&self) -> bool {
         self.recv.ready()
     }
@@ -1858,6 +1934,16 @@ impl Stream {
         };
 
         Ok(())
+    }
+
+    /// Check whether the stream is closed.
+    pub fn is_closed(&self) -> bool {
+        self.flags.contains(Closed)
+    }
+
+    /// Mark the stream as closed.
+    pub fn mark_closed(&mut self) {
+        self.flags.insert(Closed);
     }
 }
 
@@ -1948,11 +2034,7 @@ impl RecvBuf {
     /// Create a new receive-side stream buffer with given flow control limits.
     fn new(max_data: u64, max_window: u64) -> RecvBuf {
         RecvBuf {
-            flow_control: flowcontrol::FlowControl::new(
-                max_data,
-                cmp::min(max_data, DEFAULT_STREAM_WINDOW),
-                max_window,
-            ),
+            flow_control: flowcontrol::FlowControl::new(max_data, max_window),
             ..RecvBuf::default()
         }
     }
@@ -2137,7 +2219,8 @@ impl RecvBuf {
         Ok((len, self.is_fin()))
     }
 
-    /// Return true if the stream has buffered data waiting to be read by application.
+    /// Return true if the stream has buffered data to be read or an error to
+    /// be collected.
     fn ready(&self) -> bool {
         match self.data.first_key_value() {
             Some((_, buf)) => buf.off() == self.read_off,
@@ -2146,6 +2229,10 @@ impl RecvBuf {
     }
 
     /// Receive RESET_STREAM frame from peer, reset the stream at the given offset.
+    ///
+    /// If the recv side is not shutdown by the application, an empty buffer with
+    /// FIN will be written to the recv buffer to notify the application that it
+    /// has been reset by its peer.
     pub fn reset(&mut self, error_code: u64, final_size: u64) -> Result<usize> {
         // Once a final size for a stream is known, it cannot change. If a RESET_STREAM
         // frame is received indicating a change in the final size for the stream,
@@ -2187,8 +2274,9 @@ impl RecvBuf {
         Ok(max_rx_off_delta as usize)
     }
 
-    /// Shutdown the stream's receive-side, all subsequent data received on the stream
-    /// will be discarded.
+    /// Shutdown the stream's receive-side.
+    ///
+    /// After this operation, any subsequent data received on the stream will be discarded.
     fn shutdown(&mut self) -> Result<u64> {
         if self.shutdown {
             return Err(Error::Done);
@@ -2932,8 +3020,8 @@ impl StreamTransportParams {
 }
 
 /// Concurrency control for streams.
-//  RFC9000 4.6 Controlling Concurrency
-//  https://www.rfc-editor.org/rfc/rfc9000.html#name-controlling-concurrency
+/// RFC9000 4.6 Controlling Concurrency
+/// https://www.rfc-editor.org/rfc/rfc9000.html#name-controlling-concurrency
 #[derive(Clone, Debug, PartialEq, Default)]
 struct ConcurrencyControl {
     /// Maximum bidirectional streams that the peer allow local endpoint to open.
@@ -2973,15 +3061,34 @@ struct ConcurrencyControl {
     /// peer's concurrency control limit, we need to send a STREAMS_BLOCKED(type 0x17)
     /// frame to notify peer.
     streams_blocked_at_uni: Option<u64>,
+
+    /// Available stream ids for peer initiated bidirectional streams.
+    peer_bidi_avail_ids: ranges::RangeSet,
+
+    /// Available stream ids for peer initiated unidirectional streams.
+    peer_uni_avail_ids: ranges::RangeSet,
+
+    /// Available stream ids for local initiated bidirectional streams.
+    local_bidi_avail_ids: ranges::RangeSet,
+
+    /// Available stream ids for local initiated unidirectional streams.
+    local_uni_avail_ids: ranges::RangeSet,
 }
 
 impl ConcurrencyControl {
     fn new(local_max_streams_bidi: u64, local_max_streams_uni: u64) -> ConcurrencyControl {
+        let mut peer_bidi_avail_ids = ranges::RangeSet::default();
+        peer_bidi_avail_ids.insert(0..local_max_streams_bidi);
+        let mut peer_uni_avail_ids = ranges::RangeSet::default();
+        peer_uni_avail_ids.insert(0..local_max_streams_uni);
+
         ConcurrencyControl {
             local_max_streams_bidi,
             local_max_streams_bidi_next: local_max_streams_bidi,
             local_max_streams_uni,
             local_max_streams_uni_next: local_max_streams_uni,
+            peer_bidi_avail_ids,
+            peer_uni_avail_ids,
             ..ConcurrencyControl::default()
         }
     }
@@ -2991,7 +3098,12 @@ impl ConcurrencyControl {
     fn update_peer_max_streams(&mut self, bidi: bool, max_streams: u64) {
         match bidi {
             true => {
-                self.peer_max_streams_bidi = cmp::max(self.peer_max_streams_bidi, max_streams);
+                if self.peer_max_streams_bidi < max_streams {
+                    // insert available ids for local initiated bidi-streams
+                    let ids = self.peer_max_streams_bidi..max_streams;
+                    self.insert_avail_id(ids, true, true);
+                    self.peer_max_streams_bidi = max_streams;
+                }
 
                 // Cancel the concurrency control blocked state if the max_streams_bidi limit
                 // is increased, avoid sending redundant STREAMS_BLOCKED(0x16) frames.
@@ -3001,7 +3113,12 @@ impl ConcurrencyControl {
             }
 
             false => {
-                self.peer_max_streams_uni = cmp::max(self.peer_max_streams_uni, max_streams);
+                if self.peer_max_streams_uni < max_streams {
+                    // insert available ids for local initiated uni-streams
+                    let ids = self.peer_max_streams_uni..max_streams;
+                    self.insert_avail_id(ids, true, false);
+                    self.peer_max_streams_uni = max_streams;
+                }
 
                 // Cancel the concurrency control blocked state if the max_streams_uni limit
                 // is increased, avoid sending redundant STREAMS_BLOCKED(type: 0x17) frames.
@@ -3014,9 +3131,16 @@ impl ConcurrencyControl {
 
     /// After sending a MAX_STREAMS(type: 0x12..0x13) frame, update local max_streams limit.
     fn update_local_max_streams(&mut self, bidi: bool) {
-        match bidi {
-            true => self.local_max_streams_bidi = self.local_max_streams_bidi_next,
-            false => self.local_max_streams_uni = self.local_max_streams_uni_next,
+        if bidi {
+            // insert available ids for peer initiated bidi-streams
+            let ids = self.local_max_streams_bidi..self.local_max_streams_bidi_next;
+            self.insert_avail_id(ids, false, true);
+            self.local_max_streams_bidi = self.local_max_streams_bidi_next;
+        } else {
+            // insert available ids for peer initiated uni-streams
+            let ids = self.local_max_streams_uni..self.local_max_streams_uni_next;
+            self.insert_avail_id(ids, false, false);
+            self.local_max_streams_uni = self.local_max_streams_uni_next;
         }
     }
 
@@ -3097,7 +3221,7 @@ impl ConcurrencyControl {
                 let n = std::cmp::max(self.local_opened_streams_bidi, stream_sequence);
 
                 if n > self.peer_max_streams_bidi {
-                    // Can't open more bididirectional streams than the peer allows, send
+                    // Can't open more bidirectional streams than the peer allows, send
                     // a STREAMS_BLOCKED(type: 0x16) frame to notify the peer update the
                     // max_streams_bidi limit.
                     self.update_streams_blocked_at(true, Some(self.peer_max_streams_bidi));
@@ -3143,6 +3267,49 @@ impl ConcurrencyControl {
         };
 
         Ok(())
+    }
+
+    /// Check whether the given stream ID exceeds stream limits.
+    fn is_limited(&self, stream_id: u64, is_server: bool) -> bool {
+        let seq = (stream_id >> 2) + 1;
+        match (is_local(stream_id, is_server), is_bidi(stream_id)) {
+            (true, true) => seq > self.peer_max_streams_bidi,
+            (true, false) => seq > self.peer_max_streams_uni,
+            (false, true) => seq > self.local_max_streams_bidi,
+            (false, false) => seq > self.local_max_streams_uni,
+        }
+    }
+
+    /// Check whether the given stream id is available for stream creation.
+    fn is_available(&self, stream_id: u64, is_server: bool) -> bool {
+        let id = stream_id >> 2;
+        match (is_local(stream_id, is_server), is_bidi(stream_id)) {
+            (true, true) => self.local_bidi_avail_ids.contains(id),
+            (true, false) => self.local_uni_avail_ids.contains(id),
+            (false, true) => self.peer_bidi_avail_ids.contains(id),
+            (false, false) => self.peer_uni_avail_ids.contains(id),
+        }
+    }
+
+    /// Inset the given stream ids into available set.
+    fn insert_avail_id(&mut self, ids: Range<u64>, is_local: bool, is_bidi: bool) {
+        match (is_local, is_bidi) {
+            (true, true) => self.local_bidi_avail_ids.insert(ids),
+            (true, false) => self.local_uni_avail_ids.insert(ids),
+            (false, true) => self.peer_bidi_avail_ids.insert(ids),
+            (false, false) => self.peer_uni_avail_ids.insert(ids),
+        }
+    }
+
+    /// Remove the given stream id from available set.
+    fn remove_avail_id(&mut self, stream_id: u64, is_server: bool) {
+        let id = stream_id >> 2;
+        match (is_local(stream_id, is_server), is_bidi(stream_id)) {
+            (true, true) => self.local_bidi_avail_ids.remove_elem(id),
+            (true, false) => self.local_uni_avail_ids.remove_elem(id),
+            (false, true) => self.peer_bidi_avail_ids.remove_elem(id),
+            (false, false) => self.peer_uni_avail_ids.remove_elem(id),
+        }
     }
 }
 
@@ -3220,6 +3387,84 @@ mod tests {
     use super::*;
 
     // StreamMap unit tests
+    #[test]
+    fn streams_new_client() {
+        let peer_tp = StreamTransportParams {
+            initial_max_streams_bidi: crate::codec::VINT_MAX,
+            initial_max_streams_uni: crate::codec::VINT_MAX,
+            ..StreamTransportParams::default()
+        };
+        let mut map = StreamMap::new(false, 50, 50, StreamTransportParams::default());
+        map.update_peer_stream_transport_params(peer_tp);
+
+        // client initiated bidirectional streams
+        let id = map.stream_bidi_new(0, false);
+        assert_eq!(id, Ok(0));
+        let id = map.stream_bidi_new(0, false);
+        assert_eq!(id, Ok(4));
+
+        assert_eq!(map.stream_set_priority(20, 0, false), Ok(()));
+        assert_eq!(map.stream_bidi_new(0, false), Ok(24));
+        assert_eq!(
+            map.stream_set_priority(crate::codec::VINT_MAX - 3, 0, false),
+            Ok(())
+        );
+        assert_eq!(map.stream_bidi_new(0, false), Err(Error::ProtocolViolation));
+
+        // client initiated unidirectional streams
+        let id = map.stream_uni_new(0, false);
+        assert_eq!(id, Ok(2));
+        let id = map.stream_uni_new(0, false);
+        assert_eq!(id, Ok(6));
+
+        assert_eq!(map.stream_set_priority(22, 0, false), Ok(()));
+        assert_eq!(map.stream_uni_new(0, false), Ok(26));
+        assert_eq!(
+            map.stream_set_priority(crate::codec::VINT_MAX - 1, 0, false),
+            Ok(())
+        );
+        assert_eq!(map.stream_uni_new(0, false), Err(Error::ProtocolViolation));
+    }
+
+    #[test]
+    fn streams_new_server() {
+        let peer_tp = StreamTransportParams {
+            initial_max_streams_bidi: crate::codec::VINT_MAX,
+            initial_max_streams_uni: crate::codec::VINT_MAX,
+            ..StreamTransportParams::default()
+        };
+        let mut map = StreamMap::new(true, 50, 50, StreamTransportParams::default());
+        map.update_peer_stream_transport_params(peer_tp);
+
+        // server initiated bidirectional streams
+        let id = map.stream_bidi_new(1, false);
+        assert_eq!(id, Ok(1));
+        let id = map.stream_bidi_new(5, false);
+        assert_eq!(id, Ok(5));
+
+        assert_eq!(map.stream_set_priority(21, 0, false), Ok(()));
+        assert_eq!(map.stream_bidi_new(0, false), Ok(25));
+        assert_eq!(
+            map.stream_set_priority(crate::codec::VINT_MAX - 2, 0, false),
+            Ok(())
+        );
+        assert_eq!(map.stream_bidi_new(0, false), Err(Error::ProtocolViolation));
+
+        // server initiated unidirectional streams
+        let id = map.stream_uni_new(0, false);
+        assert_eq!(id, Ok(3));
+        let id = map.stream_uni_new(0, false);
+        assert_eq!(id, Ok(7));
+
+        assert_eq!(map.stream_set_priority(23, 0, false), Ok(()));
+        assert_eq!(map.stream_uni_new(0, false), Ok(27));
+        assert_eq!(
+            map.stream_set_priority(crate::codec::VINT_MAX, 0, false),
+            Ok(())
+        );
+        assert_eq!(map.stream_uni_new(0, false), Err(Error::ProtocolViolation));
+    }
+
     // Test StreamMap::write
     #[test]
     fn stream_write_invalid_sid() {
@@ -3424,7 +3669,7 @@ mod tests {
         let mut map = StreamMap::new(false, 50, 50, StreamTransportParams::default());
         map.update_peer_stream_transport_params(peer_tp);
 
-        // 1. Set priority on a invalid stream.
+        // 1. Set priority on an invalid stream.
         assert_eq!(
             map.stream_set_priority(1, 1, true),
             Err(Error::StreamStateError)
@@ -3504,10 +3749,10 @@ mod tests {
         assert!(map.readable.contains(&0));
         assert!(map.stream_shutdown(0, Shutdown::Read, 10).is_ok());
 
-        // init_max_data: 14, window: 21, read_off: 10
+        // init_max_data: 14, window: 14, read_off: 10
         // available_window: 4 < window / 2, should update max_data.
         assert_eq!(map.flow_control.max_data(), 14);
-        assert_eq!(map.flow_control.max_data_next(), 31);
+        assert_eq!(map.flow_control.max_data_next(), 24);
         assert!(map.flow_control.should_send_max_data());
         assert!(map.rx_almost_full);
     }
@@ -3653,7 +3898,7 @@ mod tests {
         assert_eq!(map.concurrency_control, ConcurrencyControl::new(5, 5));
 
         // Check connection-level flow control
-        assert_eq!(map.flow_control.window(), 150);
+        assert_eq!(map.flow_control.window(), 100);
         assert_eq!(map.flow_control.max_data(), 100);
         assert!(
             !map.flow_control.should_send_max_data(),
@@ -4724,8 +4969,7 @@ mod tests {
         };
 
         let mut map = StreamMap::new(true, 50, 50, local_tp);
-        // init window = initial_max_data /2 * 3
-        assert_eq!(map.flow_control.window(), 30);
+        assert_eq!(map.flow_control.window(), 20);
         assert_eq!(map.flow_control.max_data(), 20);
 
         // 1. Receive a RESET_STREAM frame for a stream which has received some data
@@ -4738,10 +4982,10 @@ mod tests {
         );
         assert_eq!(map.on_reset_stream_frame_received(4, 0, 4), Ok(()));
         // map.flow_control.consumed = 4
-        assert_eq!(map.flow_control.max_data_next(), 34);
+        assert_eq!(map.flow_control.max_data_next(), 24);
         assert!(
             !map.flow_control.should_send_max_data(),
-            "available_window = 16 > 15 = window/2, not update max_data"
+            "available_window = 16 > 10 = window/2, not update max_data"
         );
         assert!(!map.rx_almost_full);
 
@@ -4750,15 +4994,15 @@ mod tests {
         // stream_id: 8, max received offset: 1, final size: 2.
         let stream = map.get_or_create(8, false).unwrap();
         assert_eq!(
-            stream.recv.write(0, Bytes::from_static(b"O"), false),
+            stream.recv.write(0, Bytes::from_static(b"QUICQUIC"), false),
             Ok(())
         );
-        assert_eq!(map.on_reset_stream_frame_received(8, 0, 2), Ok(()));
-        // map.flow_control.consumed = 6
-        assert_eq!(map.flow_control.max_data_next(), 36);
+        assert_eq!(map.on_reset_stream_frame_received(8, 0, 8), Ok(()));
+        // map.flow_control.consumed = 12
+        assert_eq!(map.flow_control.max_data_next(), 32);
         assert!(
             map.flow_control.should_send_max_data(),
-            "available_window = 14 < 15 = window/2, update max_data"
+            "available_window = 8 < 10 = window/2, update max_data"
         );
         assert!(map.rx_almost_full);
     }
@@ -5099,8 +5343,7 @@ mod tests {
             initial_max_streams_uni: 5,
         };
         let mut map = StreamMap::new(true, 50, 50, local_tp);
-        // init window = initial_max_data /2 * 3
-        assert_eq!(map.flow_control.window(), 30);
+        assert_eq!(map.flow_control.window(), 20);
         assert_eq!(map.flow_control.max_data(), 20);
 
         // Create stream 4
@@ -5116,19 +5359,19 @@ mod tests {
         // map.flow_control.consumed = 4
         assert!(
             !map.flow_control.should_send_max_data(),
-            "available_window = 16 > 15 = window/2, not update max_data"
+            "available_window = 16 > 10 = window/2, not update max_data"
         );
         assert!(!map.rx_almost_full);
 
         // Receive the second block of data of stream 4, should update max_data
         assert_eq!(
-            map.on_stream_frame_received(4, 4, 2, false, Bytes::from_static(b"GO")),
+            map.on_stream_frame_received(4, 4, 8, false, Bytes::from_static(b"QUICQUIC")),
             Ok(())
         );
-        // map.flow_control.consumed = 6
+        // map.flow_control.consumed = 12
         assert!(
             map.flow_control.should_send_max_data(),
-            "available_window = 14 < 15 = window/2, update max_data"
+            "available_window = 8 < 10 = window/2, update max_data"
         );
         assert!(map.rx_almost_full);
     }
@@ -5202,7 +5445,7 @@ mod tests {
         map.on_stream_frame_acked(0, 10, 4);
         assert!(map.is_closed(0));
 
-        // Receive a ACK frame for a stream which has been closed, do nothing.
+        // Receive an ACK frame for a stream which has been closed, do nothing.
         map.on_stream_frame_acked(0, 10, 4);
     }
 
@@ -5224,7 +5467,7 @@ mod tests {
         assert!(stream.send.is_complete());
         map.on_reset_stream_frame_acked(4);
 
-        // Receive a ACK for a RESET_STREAM frame, no effect on the stream receive-side.
+        // Receive an ACK for a RESET_STREAM frame, no effect on the stream receive-side.
         // The stream is still not complete because the stream receive-side is not complete.
         let stream = map.get_mut(4).unwrap();
         assert!(!stream.is_complete());
@@ -5247,7 +5490,7 @@ mod tests {
         map.on_reset_stream_frame_acked(4);
         assert!(map.is_closed(4));
 
-        // Receive a ACK for a RESET_STREAM frame which has been closed, do nothing.
+        // Receive an ACK for a RESET_STREAM frame which has been closed, do nothing.
         map.on_reset_stream_frame_acked(4);
     }
 
@@ -5923,6 +6166,11 @@ mod tests {
     #[test]
     fn concurrency_control_new() {
         let cc = ConcurrencyControl::new(10, 3);
+
+        let mut peer_bidi_avail_ids = ranges::RangeSet::default();
+        peer_bidi_avail_ids.insert(0..10);
+        let mut peer_uni_avail_ids = ranges::RangeSet::default();
+        peer_uni_avail_ids.insert(0..3);
         assert_eq!(
             cc,
             ConcurrencyControl {
@@ -5938,6 +6186,9 @@ mod tests {
                 peer_opened_streams_uni: 0,
                 streams_blocked_at_bidi: None,
                 streams_blocked_at_uni: None,
+                peer_bidi_avail_ids,
+                peer_uni_avail_ids,
+                ..ConcurrencyControl::default()
             }
         );
     }

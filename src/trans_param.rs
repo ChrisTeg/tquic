@@ -113,6 +113,12 @@ pub struct TransportParams {
     /// This parameter has a zero-length value.
     /// See draft-ietf-quic-multipath-05.
     pub enable_multipath: bool,
+
+    /// The parameter is used to negotiate the disablement of encryption on 1-RTT
+    /// packets. It is only meant to be used in environments where both endpoints
+    /// completely trust the path between themselves.
+    /// See draft-banks-quic-disable-encryption-00.
+    pub disable_encryption: bool,
 }
 
 impl TransportParams {
@@ -254,6 +260,10 @@ impl TransportParams {
                     tp.enable_multipath = true;
                 }
 
+                0xbaad => {
+                    tp.disable_encryption = true;
+                }
+
                 // Ignore unknown parameters.
                 _ => (),
             }
@@ -387,27 +397,27 @@ impl TransportParams {
             buf.write_varint(0)?;
         }
 
+        if tp.disable_encryption {
+            buf.write_varint(0xbaad)?;
+            buf.write_varint(0)?;
+        }
+
         Ok(len - buf.len())
     }
 
     /// Create TransportParametersSet event data for Qlog.
-    pub fn to_qlog(
-        &self,
-        owner: qlog::events::TransportOwner,
-        cipher: Option<tls::Algorithm>,
-    ) -> EventData {
+    pub fn to_qlog(&self, owner: qlog::events::Owner, cipher: Option<tls::Algorithm>) -> EventData {
         let original_destination_connection_id = Some(format!(
             "{:?}",
             self.original_destination_connection_id.as_ref()
         ));
         let stateless_reset_token = Some(format!("{:?}", self.stateless_reset_token.as_ref()));
 
-        qlog::events::EventData::TransportParametersSet {
+        qlog::events::EventData::QuicParametersSet {
             owner: Some(owner),
             resumption_allowed: None,
             early_data_enabled: None,
             tls_cipher: Some(format!("{:?}", cipher)),
-            aead_tag_length: None,
             original_destination_connection_id,
             initial_source_connection_id: None,
             retry_source_connection_id: None,
@@ -425,6 +435,8 @@ impl TransportParams {
             initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
             initial_max_streams_uni: Some(self.initial_max_streams_uni),
             preferred_address: None,
+            max_datagram_frame_size: None,
+            grease_quic_bit: None,
         }
     }
 }
@@ -467,6 +479,7 @@ impl Default for TransportParams {
             retry_source_connection_id: None,
 
             enable_multipath: false,
+            disable_encryption: false,
         }
     }
 }
@@ -566,6 +579,7 @@ mod tests {
             initial_source_connection_id: Some(ConnectionId::random()),
             retry_source_connection_id: None,
             enable_multipath: true,
+            disable_encryption: false,
         };
 
         // encode on the client side
@@ -609,6 +623,7 @@ mod tests {
             initial_source_connection_id: Some(ConnectionId::random()),
             retry_source_connection_id: Some(ConnectionId::random()),
             enable_multipath: false,
+            disable_encryption: true,
         };
 
         // encode on the server side

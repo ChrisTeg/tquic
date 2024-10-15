@@ -16,6 +16,7 @@ use log::*;
 use std::time::Instant;
 
 use crate::connection::path::PathMap;
+use crate::connection::space::BufferType;
 use crate::connection::space::PacketNumSpaceMap;
 use crate::connection::space::SentPacket;
 use crate::connection::stream::StreamMap;
@@ -48,7 +49,7 @@ impl MultipathScheduler for RedundantScheduler {
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) -> Result<usize> {
-        for (pid, path) in paths.iter() {
+        for (pid, path) in paths.iter_mut() {
             // Skip the path that is not ready for sending non-probing packets.
             if !path.active() || !path.recovery.can_send() {
                 continue;
@@ -68,7 +69,7 @@ impl MultipathScheduler for RedundantScheduler {
         spaces: &mut PacketNumSpaceMap,
         streams: &mut StreamMap,
     ) {
-        if packet.reinjected {
+        if packet.buffer_flags.has_buffered() {
             return;
         }
 
@@ -84,7 +85,7 @@ impl MultipathScheduler for RedundantScheduler {
             for frame in &packet.frames {
                 if let Frame::Stream { .. } = frame {
                     debug!("RedundantScheduler: inject {:?} on path {:?}", frame, pid);
-                    space.reinject.frames.push_back(frame.clone());
+                    space.buffered.push_back(frame.clone(), BufferType::High);
                 }
             }
         }

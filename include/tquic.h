@@ -7,8 +7,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
-#include <sys/socket.h>
-#include <sys/types.h>
+#include "openssl/ssl.h"
+#include "tquic_def.h"
 
 /**
  * The current QUIC wire version.
@@ -21,13 +21,19 @@
 #define QUIC_VERSION_V1 1
 
 /**
- * Available congestion control algorithm
+ * The Connection ID MUST NOT exceed 20 bytes in QUIC version 1.
+ * See RFC 9000 Section 17.2
+ */
+#define MAX_CID_LEN 20
+
+/**
+ * Available congestion control algorithms.
  */
 typedef enum quic_congestion_control_algorithm {
   /**
    * CUBIC uses a cubic function instead of a linear window increase function
    * of the current TCP standards to improve scalability and stability under
-   * fast and long-distance networks..
+   * fast and long-distance networks.
    */
   QUIC_CONGESTION_CONTROL_ALGORITHM_CUBIC,
   /**
@@ -51,7 +57,42 @@ typedef enum quic_congestion_control_algorithm {
    * (Experimental)
    */
   QUIC_CONGESTION_CONTROL_ALGORITHM_COPA,
+  /**
+   * Dummy is a simple congestion controller with a static congestion window.
+   * It is intended to be used for testing and experiments.
+   */
+  QUIC_CONGESTION_CONTROL_ALGORITHM_DUMMY,
 } quic_congestion_control_algorithm;
+
+/**
+ * Available multipath scheduling algorithms.
+ */
+typedef enum quic_multipath_algorithm {
+  /**
+   * The scheduler sends packets over the path with the lowest smoothed RTT
+   * among all available paths. It aims to optimize throughput and achieve
+   * load balancing, making it particularly advantageous for bulk transfer
+   * applications in heterogeneous networks.
+   */
+  QUIC_MULTIPATH_ALGORITHM_MIN_RTT,
+  /**
+   * The scheduler sends all packets redundantly on all available paths. It
+   * utilizes additional bandwidth to minimize latency, thereby reducing the
+   * overall flow completion time for applications with bounded bandwidth
+   * requirements that can be met by a single path.
+   * In scenarios where two paths with varying available bandwidths are
+   * present, it ensures a goodput at least equivalent to the best single
+   * path.
+   */
+  QUIC_MULTIPATH_ALGORITHM_REDUNDANT,
+  /**
+   * The scheduler sends packets over available paths in a round robin
+   * manner. It aims to fully utilize the capacity of each path as the
+   * distribution across all path is equal. It is only used for testing
+   * purposes.
+   */
+  QUIC_MULTIPATH_ALGORITHM_ROUND_ROBIN,
+} quic_multipath_algorithm;
 
 /**
  * The stream's side to shutdown.
@@ -107,9 +148,11 @@ typedef struct http3_conn_t http3_conn_t;
  */
 typedef struct http3_headers_t http3_headers_t;
 
+typedef struct quic_tls_config_t quic_tls_config_t;
+
 typedef struct quic_tls_config_select_methods_t {
-  SSL_CTX *(*get_default)(void *ctx);
-  SSL_CTX *(*select)(void *ctx, const uint8_t *server_name, size_t server_name_len);
+  struct quic_tls_config_t *(*get_default)(void *ctx);
+  struct quic_tls_config_t *(*select)(void *ctx, const uint8_t *server_name, size_t server_name_len);
 } quic_tls_config_select_methods_t;
 
 typedef void *quic_tls_config_select_context_t;
@@ -161,7 +204,7 @@ typedef struct quic_transport_methods_t {
 typedef void *quic_transport_context_t;
 
 /**
- * Data and meta information of a outgoing packet.
+ * Data and meta information of an outgoing packet.
  */
 typedef struct quic_packet_out_spec_t {
   const struct iovec *iov;
@@ -186,7 +229,35 @@ typedef struct quic_packet_send_methods_t {
 typedef void *quic_packet_send_context_t;
 
 /**
- * Meta information of a incoming packet.
+ * Connection Id is an identifier used to identify a QUIC connection
+ * at an endpoint.
+ */
+typedef struct ConnectionId {
+  /**
+   * length of cid
+   */
+  uint8_t len;
+  /**
+   * octets of cid
+   */
+  uint8_t data[MAX_CID_LEN];
+} ConnectionId;
+
+typedef struct ConnectionIdGeneratorMethods {
+  /**
+   * Generate a new CID
+   */
+  struct ConnectionId (*generate)(void *gctx);
+  /**
+   * Return the length of a CID
+   */
+  uint8_t (*cid_len)(void *gctx);
+} ConnectionIdGeneratorMethods;
+
+typedef void *ConnectionIdGeneratorContext;
+
+/**
+ * Meta information of an incoming packet.
  */
 typedef struct quic_packet_info_t {
   const struct sockaddr *src;
@@ -201,6 +272,130 @@ typedef struct quic_path_address_t {
   struct sockaddr_storage remote_addr;
   socklen_t remote_addr_len;
 } quic_path_address_t;
+
+/**
+ * Statistics about path
+ */
+typedef struct quic_path_stats_t {
+  /**
+   * The number of QUIC packets received.
+   */
+  uint64_t recv_count;
+  /**
+   * The number of received bytes.
+   */
+  uint64_t recv_bytes;
+  /**
+   * The number of QUIC packets sent.
+   */
+  uint64_t sent_count;
+  /**
+   * The number of sent bytes.
+   */
+  uint64_t sent_bytes;
+  /**
+   * The number of QUIC packets lost.
+   */
+  uint64_t lost_count;
+  /**
+   * The number of lost bytes.
+   */
+  uint64_t lost_bytes;
+  /**
+   * Total number of packets acked.
+   */
+  uint64_t acked_count;
+  /**
+   * Total number of bytes acked.
+   */
+  uint64_t acked_bytes;
+  /**
+   * Initial congestion window in bytes.
+   */
+  uint64_t init_cwnd;
+  /**
+   * Final congestion window in bytes.
+   */
+  uint64_t final_cwnd;
+  /**
+   * Maximum congestion window in bytes.
+   */
+  uint64_t max_cwnd;
+  /**
+   * Minimum congestion window in bytes.
+   */
+  uint64_t min_cwnd;
+  /**
+   * Maximum inflight data in bytes.
+   */
+  uint64_t max_inflight;
+  /**
+   * Total loss events.
+   */
+  uint64_t loss_event_count;
+  /**
+   * Total congestion window limited events.
+   */
+  uint64_t cwnd_limited_count;
+  /**
+   * Total duration of congestion windowlimited events in microseconds.
+   */
+  uint64_t cwnd_limited_duration;
+  /**
+   * Minimum roundtrip time in microseconds.
+   */
+  uint64_t min_rtt;
+  /**
+   * Maximum roundtrip time in microseconds.
+   */
+  uint64_t max_rtt;
+  /**
+   * Smoothed roundtrip time in microseconds.
+   */
+  uint64_t srtt;
+  /**
+   * Roundtrip time variation in microseconds.
+   */
+  uint64_t rttvar;
+  /**
+   * Whether the congestion controller is in slow start status.
+   */
+  bool in_slow_start;
+  /**
+   * Pacing rate estimated by congestion control algorithm.
+   */
+  uint64_t pacing_rate;
+} quic_path_stats_t;
+
+/**
+ * Statistics about a QUIC connection.
+ */
+typedef struct quic_conn_stats_t {
+  /**
+   * Total number of received packets.
+   */
+  uint64_t recv_count;
+  /**
+   * Total number of bytes received on the connection.
+   */
+  uint64_t recv_bytes;
+  /**
+   * Total number of sent packets.
+   */
+  uint64_t sent_count;
+  /**
+   * Total number of bytes sent on the connection.
+   */
+  uint64_t sent_bytes;
+  /**
+   * Total number of lost packets.
+   */
+  uint64_t lost_count;
+  /**
+   * Total number of bytes lost on the connection.
+   */
+  uint64_t lost_bytes;
+} quic_conn_stats_t;
 
 typedef struct http3_methods_t {
   /**
@@ -287,31 +482,44 @@ void quic_config_set_max_handshake_timeout(struct quic_config_t *config, uint64_
 void quic_config_set_recv_udp_payload_size(struct quic_config_t *config, uint16_t v);
 
 /**
- * Set the maximum outgoing UDP payload size.
- * This is depended on both the configured max payload size and the max_udp_payload_size
- * transport parameter advertised by the remote peer.
- * The default and minimum value is `1200`.
+ * Enable the Datagram Packetization Layer Path MTU Discovery
+ * default value is true.
+ */
+void enable_dplpmtud(struct quic_config_t *config, bool v);
+
+/**
+ * Set the maximum outgoing UDP payload size in bytes.
+ * It corresponds to the maximum datagram size that DPLPMTUD tries to discovery.
+ * The default value is `1200` which means let DPLPMTUD choose a value.
  */
 void quic_config_set_send_udp_payload_size(struct quic_config_t *config, uintptr_t v);
 
 /**
  * Set the `initial_max_data` transport parameter. It means the initial
  * value for the maximum amount of data that can be sent on the connection.
+ * The value is capped by the setting `max_connection_window`.
+ * The default value is `10485760`.
  */
 void quic_config_set_initial_max_data(struct quic_config_t *config, uint64_t v);
 
 /**
  * Set the `initial_max_stream_data_bidi_local` transport parameter.
+ * The value is capped by the setting `max_stream_window`.
+ * The default value is `5242880`.
  */
 void quic_config_set_initial_max_stream_data_bidi_local(struct quic_config_t *config, uint64_t v);
 
 /**
  * Set the `initial_max_stream_data_bidi_remote` transport parameter.
+ * The value is capped by the setting `max_stream_window`.
+ * The default value is `2097152`.
  */
 void quic_config_set_initial_max_stream_data_bidi_remote(struct quic_config_t *config, uint64_t v);
 
 /**
  * Set the `initial_max_stream_data_uni` transport parameter.
+ * The value is capped by the setting `max_stream_window`.
+ * The default value is `1048576`.
  */
 void quic_config_set_initial_max_stream_data_uni(struct quic_config_t *config, uint64_t v);
 
@@ -354,11 +562,74 @@ void quic_config_set_initial_congestion_window(struct quic_config_t *config, uin
 void quic_config_set_min_congestion_window(struct quic_config_t *config, uint64_t v);
 
 /**
+ * Set the threshold for slow start in packets.
+ * The default value is the maximum value of u64.
+ */
+void quic_config_set_slow_start_thresh(struct quic_config_t *config, uint64_t v);
+
+/**
+ * Set the minimum duration for BBR ProbeRTT state in milliseconds.
+ * The default value is 200 milliseconds.
+ */
+void quic_config_set_bbr_probe_rtt_duration(struct quic_config_t *config, uint64_t v);
+
+/**
+ * Enable using a cwnd based on bdp during ProbeRTT state.
+ * The default value is false.
+ */
+void quic_config_enable_bbr_probe_rtt_based_on_bdp(struct quic_config_t *config, bool v);
+
+/**
+ * Set the cwnd gain for BBR ProbeRTT state.
+ * The default value is 0.75
+ */
+void quic_config_set_bbr_probe_rtt_cwnd_gain(struct quic_config_t *config, double v);
+
+/**
+ * Set the length of the BBR RTProp min filter window in milliseconds.
+ * The default value is 10000 milliseconds.
+ */
+void quic_config_set_bbr_rtprop_filter_len(struct quic_config_t *config, uint64_t v);
+
+/**
+ * Set the cwnd gain for BBR ProbeBW state.
+ * The default value is 2.0
+ */
+void quic_config_set_bbr_probe_bw_cwnd_gain(struct quic_config_t *config, double v);
+
+/**
+ * Set the delta in copa slow start state.
+ */
+void quic_config_set_copa_slow_start_delta(struct quic_config_t *config, double v);
+
+/**
+ * Set the delta in coap steady state.
+ */
+void quic_config_set_copa_steady_delta(struct quic_config_t *config, double v);
+
+/**
+ * Enable Using the rtt standing instead of the latest rtt to calculate queueing delay.
+ */
+void quic_config_enable_copa_use_standing_rtt(struct quic_config_t *config, bool v);
+
+/**
  * Set the initial RTT in milliseconds. The default value is 333ms.
  * The configuration should be changed with caution. Setting a value less than the default
  * will cause retransmission of handshake packets to be more aggressive.
  */
 void quic_config_set_initial_rtt(struct quic_config_t *config, uint64_t v);
+
+/**
+ * Enable pacing to smooth the flow of packets sent onto the network.
+ * The default value is true.
+ */
+void quic_config_enable_pacing(struct quic_config_t *config, bool v);
+
+/**
+ * Set clock granularity used by the pacer.
+ * The default value is 10 milliseconds.
+ */
+void quic_config_set_pacing_granularity(struct quic_config_t *config, uint64_t v);
 
 /**
  * Set the linear factor for calculating the probe timeout.
@@ -383,12 +654,28 @@ void quic_config_set_max_pto(struct quic_config_t *config, uint64_t v);
 void quic_config_set_active_connection_id_limit(struct quic_config_t *config, uint64_t v);
 
 /**
+ * Set the `enable_multipath` transport parameter.
+ * The default value is false. (Experimental)
+ */
+void quic_config_enable_multipath(struct quic_config_t *config, bool enabled);
+
+/**
+ * Set the multipath scheduling algorithm
+ * The default value is MultipathAlgorithm::MinRtt
+ */
+void quic_config_set_multipath_algorithm(struct quic_config_t *config,
+                                         enum quic_multipath_algorithm v);
+
+/**
  * Set the maximum size of the connection flow control window.
+ * The default value is MAX_CONNECTION_WINDOW (15 MB).
  */
 void quic_config_set_max_connection_window(struct quic_config_t *config, uint64_t v);
 
 /**
  * Set the maximum size of the stream flow control window.
+ * The value should not be greater than the setting `max_connection_window`.
+ * The default value is MAX_STREAM_WINDOW (6 MB).
  */
 void quic_config_set_max_stream_window(struct quic_config_t *config, uint64_t v);
 
@@ -400,24 +687,22 @@ void quic_config_set_max_concurrent_conns(struct quic_config_t *config, uint32_t
 /**
  * Set the key for reset token generation. The token_key_len should be not less
  * than 64.
+ * Applicable to Server only.
  */
 int quic_config_set_reset_token_key(struct quic_config_t *config,
                                     const uint8_t *token_key,
                                     size_t token_key_len);
 
 /**
- * Set whether stateless reset is allowed.
- */
-void quic_config_enable_stateless_reset(struct quic_config_t *config, bool enabled);
-
-/**
  * Set the lifetime of address token.
+ * Applicable to Server only.
  */
 void quic_config_set_address_token_lifetime(struct quic_config_t *config, uint64_t seconds);
 
 /**
- * Set the key for address token generation.
+ * Set the key for address token generation. It also enables retry.
  * The token_key_len should be a multiple of 16.
+ * Applicable to Server only.
  */
 int quic_config_set_address_token_key(struct quic_config_t *config,
                                       const uint8_t *token_keys,
@@ -425,18 +710,146 @@ int quic_config_set_address_token_key(struct quic_config_t *config,
 
 /**
  * Set whether stateless retry is allowed. Default is not allowed.
+ * Applicable to Server only.
  */
 void quic_config_enable_retry(struct quic_config_t *config, bool enabled);
 
 /**
+ * Set whether stateless reset is allowed.
+ * Applicable to Endpoint only.
+ */
+void quic_config_enable_stateless_reset(struct quic_config_t *config, bool enabled);
+
+/**
  * Set the length of source cid. The length should not be greater than 20.
+ * Applicable to Endpoint only.
  */
 void quic_config_set_cid_len(struct quic_config_t *config, uint8_t v);
 
 /**
+ * Set the anti-amplification factor.
+ *
+ * The server limits the data sent to an unvalidated address to
+ * `anti_amplification_factor` times the received data.
+ */
+void quic_config_set_anti_amplification_factor(struct quic_config_t *config, uint8_t v);
+
+/**
  * Set the batch size for sending packets.
+ * Applicable to Endpoint only.
  */
 void quic_config_set_send_batch_size(struct quic_config_t *config, uint16_t v);
+
+/**
+ * Set the buffer size for disordered zerortt packets on the server.
+ * The default value is `1000`. A value of 0 will be treated as default value.
+ * Applicable to Server only.
+ */
+void quic_config_set_zerortt_buffer_size(struct quic_config_t *config, uint16_t v);
+
+/**
+ * Set the maximum number of undecryptable packets that can be stored by one connection.
+ * The default value is `10`. A value of 0 will be treated as default value.
+ */
+void quic_config_set_max_undecryptable_packets(struct quic_config_t *config, uint16_t v);
+
+/**
+ * Enable or disable encryption on 1-RTT packets. (Experimental)
+ * The default value is true.
+ * WARN: The The disable_1rtt_encryption extension is not meant to be used
+ * for any practical application protocol on the open internet.
+ */
+void quic_config_enable_encryption(struct quic_config_t *config, bool v);
+
+/**
+ * Create a new TlsConfig.
+ * The caller is responsible for the memory of the TlsConfig and should properly
+ * destroy it by calling `quic_tls_config_free`.
+ */
+struct quic_tls_config_t *quic_tls_config_new(void);
+
+/**
+ * Create a new TlsConfig with SSL_CTX.
+ * When using raw SSL_CTX, TlsSession::session() and TlsSession::set_keylog() won't take effect.
+ * The caller is responsible for the memory of TlsConfig and SSL_CTX when use this function.
+ */
+struct quic_tls_config_t *quic_tls_config_new_with_ssl_ctx(SSL_CTX *ssl_ctx);
+
+/**
+ * Create a new client side TlsConfig.
+ * The caller is responsible for the memory of the TlsConfig and should properly
+ * destroy it by calling `quic_tls_config_free`.
+ * For more information about `protos`, please see `quic_tls_config_set_application_protos`.
+ */
+struct quic_tls_config_t *quic_tls_config_new_client_config(const char *const *protos,
+                                                            intptr_t proto_num,
+                                                            bool enable_early_data);
+
+/**
+ * Create a new server side TlsConfig.
+ * The caller is responsible for the memory of the TlsConfig and should properly
+ * destroy it by calling `quic_tls_config_free`.
+ * For more information about `protos`, please see `quic_tls_config_set_application_protos`.
+ */
+struct quic_tls_config_t *quic_tls_config_new_server_config(const char *cert_file,
+                                                            const char *key_file,
+                                                            const char *const *protos,
+                                                            intptr_t proto_num,
+                                                            bool enable_early_data);
+
+/**
+ * Destroy a TlsConfig instance.
+ */
+void quic_tls_config_free(struct quic_tls_config_t *tls_config);
+
+/**
+ * Set whether early data is allowed.
+ */
+void quic_tls_config_set_early_data_enabled(struct quic_tls_config_t *tls_config, bool enable);
+
+/**
+ * Set the session lifetime in seconds
+ */
+void quic_tls_config_set_session_timeout(struct quic_tls_config_t *tls_config, uint32_t timeout);
+
+/**
+ * Set the list of supported application protocols.
+ * The `protos` is a pointer that points to an array, where each element of the array is a string
+ * pointer representing an application protocol identifier. For example, you can define it as
+ * follows: const char* const protos[2] = {"h3", "http/0.9"}.
+ */
+int quic_tls_config_set_application_protos(struct quic_tls_config_t *tls_config,
+                                           const char *const *protos,
+                                           intptr_t proto_num);
+
+/**
+ * Set session ticket key for server.
+ */
+int quic_tls_config_set_ticket_key(struct quic_tls_config_t *tls_config,
+                                   const uint8_t *ticket_key,
+                                   size_t ticket_key_len);
+
+/**
+ * Set the certificate verification behavior.
+ */
+void quic_tls_config_set_verify(struct quic_tls_config_t *tls_config, bool verify);
+
+/**
+ * Set the PEM-encoded certificate file.
+ */
+int quic_tls_config_set_certificate_file(struct quic_tls_config_t *tls_config,
+                                         const char *cert_file);
+
+/**
+ * Set the PEM-encoded private key file.
+ */
+int quic_tls_config_set_private_key_file(struct quic_tls_config_t *tls_config,
+                                         const char *key_file);
+
+/**
+ * Set CA certificates.
+ */
+int quic_tls_config_set_ca_certs(struct quic_tls_config_t *tls_config, const char *ca_path);
 
 /**
  * Set TLS config selector.
@@ -447,9 +860,11 @@ void quic_config_set_tls_selector(struct quic_config_t *config,
 
 /**
  * Set TLS config.
- * The caller is responsible for the memory of SSL_CTX when use this function.
+ *
+ * Note: Config doesn't own the TlsConfig when using this function.
+ * It is the responsibility of the caller to release it.
  */
-void quic_config_set_tls_config(struct quic_config_t *config, SSL_CTX *ssl_ctx);
+void quic_config_set_tls_config(struct quic_config_t *config, struct quic_tls_config_t *tls_config);
 
 /**
  * Create a QUIC endpoint.
@@ -474,8 +889,17 @@ struct quic_endpoint_t *quic_endpoint_new(struct quic_config_t *config,
 void quic_endpoint_free(struct quic_endpoint_t *endpoint);
 
 /**
+ * Set the connection id generator for the endpoint.
+ * By default, the random connection id generator is used.
+ */
+void quic_endpoint_set_cid_generator(struct quic_endpoint_t *endpoint,
+                                     const struct ConnectionIdGeneratorMethods *cid_gen_methods,
+                                     ConnectionIdGeneratorContext cid_gen_ctx);
+
+/**
  * Create a client connection.
  * If success, the output parameter `index` carrys the index of the connection.
+ * Note: The `config` specific to the endpoint or server is irrelevant and will be disregarded.
  */
 int quic_endpoint_connect(struct quic_endpoint_t *endpoint,
                           const struct sockaddr *local,
@@ -487,6 +911,7 @@ int quic_endpoint_connect(struct quic_endpoint_t *endpoint,
                           size_t session_len,
                           const uint8_t *token,
                           size_t token_len,
+                          const struct quic_config_t *config,
                           uint64_t *index);
 
 /**
@@ -579,6 +1004,26 @@ void quic_conn_server_name(struct quic_conn_t *conn, const uint8_t **out, size_t
 void quic_conn_session(struct quic_conn_t *conn, const uint8_t **out, size_t *out_len);
 
 /**
+ * Return details why 0-RTT was accepted or rejected.
+ */
+int quic_conn_early_data_reason(struct quic_conn_t *conn, const uint8_t **out, size_t *out_len);
+
+/**
+ * Send a Ping frame on the active path(s) for keep-alive.
+ */
+int quic_conn_ping(struct quic_conn_t *conn);
+
+/**
+ * Send a Ping frame on the specified path for keep-alive.
+ * The API is only applicable to multipath quic connections.
+ */
+int quic_conn_ping_path(struct quic_conn_t *conn,
+                        const struct sockaddr *local,
+                        socklen_t local_len,
+                        const struct sockaddr *remote,
+                        socklen_t remote_len);
+
+/**
  * Add a new path on the client connection.
  */
 int quic_conn_add_path(struct quic_conn_t *conn,
@@ -628,6 +1073,20 @@ bool quic_conn_path_iter_next(struct quic_path_address_iter_t *iter, struct quic
 bool quic_conn_active_path(const struct quic_conn_t *conn, struct quic_path_address_t *a);
 
 /**
+ * Return the latest statistics about the specified path.
+ */
+const struct quic_path_stats_t *quic_conn_path_stats(struct quic_conn_t *conn,
+                                                     const struct sockaddr *local,
+                                                     socklen_t local_len,
+                                                     const struct sockaddr *remote,
+                                                     socklen_t remote_len);
+
+/**
+ * Return statistics about the connection.
+ */
+const struct quic_conn_stats_t *quic_conn_stats(struct quic_conn_t *conn);
+
+/**
  * Return the trace id of the connection
  */
 void quic_conn_trace_id(struct quic_conn_t *conn, const uint8_t **out, size_t *out_len);
@@ -640,7 +1099,17 @@ bool quic_conn_is_draining(struct quic_conn_t *conn);
 /**
  * Check whether the connection is closing.
  */
+bool quic_conn_is_closing(struct quic_conn_t *conn);
+
+/**
+ * Check whether the connection is closed.
+ */
 bool quic_conn_is_closed(struct quic_conn_t *conn);
+
+/**
+ * Check whether the connection was closed due to handshake timeout.
+ */
+bool quic_conn_is_handshake_timeout(struct quic_conn_t *conn);
 
 /**
  * Check whether the connection was closed due to idle timeout.
@@ -681,12 +1150,35 @@ void quic_conn_set_context(struct quic_conn_t *conn, void *data);
 void *quic_conn_context(struct quic_conn_t *conn);
 
 /**
- * Set keylog file
+ * Set the callback of keylog output.
+ * `cb` is a callback function that will be called for each keylog.
+ * `data` is a keylog message and `argp` is user-defined data that will be passed to the callback.
+ */
+void quic_conn_set_keylog(struct quic_conn_t *conn, void (*cb)(const uint8_t *data,
+                                                               size_t data_len,
+                                                               void *argp), void *argp);
+
+/**
+ * Set keylog file.
+ * Note: The API is not applicable for Windows.
  */
 void quic_conn_set_keylog_fd(struct quic_conn_t *conn, int fd);
 
 /**
- * Set qlog file
+ * Set the callback of qlog output.
+ * `cb` is a callback function that will be called for each qlog.
+ * `data` is a qlog message and `argp` is user-defined data that will be passed to the callback.
+ * `title` and `desc` respectively refer to the "title" and "description" sections of qlog.
+ */
+void quic_conn_set_qlog(struct quic_conn_t *conn,
+                        void (*cb)(const uint8_t *data, size_t data_len, void *argp),
+                        void *argp,
+                        const char *title,
+                        const char *desc);
+
+/**
+ * Set qlog file.
+ * Note: The API is not applicable for Windows.
  */
 void quic_conn_set_qlog_fd(struct quic_conn_t *conn, int fd, const char *title, const char *desc);
 
@@ -728,12 +1220,33 @@ ssize_t quic_stream_write(struct quic_conn_t *conn,
                           bool fin);
 
 /**
- * Create a new quic transport stream with the given id and priority.
+ * Create a new quic stream with the given id and priority.
+ * This is a low-level API for stream creation. It is recommended to use
+ * `quic_stream_bidi_new` for bidirectional streams or `quic_stream_uni_new`
+ * for unidrectional streams.
  */
 int quic_stream_new(struct quic_conn_t *conn,
                     uint64_t stream_id,
                     uint8_t urgency,
                     bool incremental);
+
+/**
+ * Create a new quic bidiectional stream with the given priority.
+ * If success, the output parameter `stream_id` carrys the id of the created stream.
+ */
+int quic_stream_bidi_new(struct quic_conn_t *conn,
+                         uint8_t urgency,
+                         bool incremental,
+                         uint64_t *stream_id);
+
+/**
+ * Create a new quic uniectional stream with the given priority.
+ * If success, the output parameter `stream_id` carrys the id of the created stream.
+ */
+int quic_stream_uni_new(struct quic_conn_t *conn,
+                        uint8_t urgency,
+                        bool incremental,
+                        uint64_t *stream_id);
 
 /**
  * Shutdown stream reading or writing.
@@ -770,6 +1283,17 @@ int quic_stream_set_context(struct quic_conn_t *conn, uint64_t stream_id, void *
  * Return the stream’s user context.
  */
 void *quic_stream_context(struct quic_conn_t *conn, uint64_t stream_id);
+
+/**
+ * Extract the header form, version and destination connection id from the
+ * QUIC packet.
+ */
+int quic_packet_header_info(uint8_t *buf,
+                            size_t buf_len,
+                            uint8_t dcid_len,
+                            bool *long_header,
+                            uint32_t *version,
+                            struct ConnectionId *dcid);
 
 /**
  * Create default config for HTTP3.
@@ -864,19 +1388,19 @@ int64_t http3_stream_new_with_priority(struct http3_conn_t *conn,
                                        const struct http3_priority_t *priority);
 
 /**
+ * Close the given HTTP/3 stream.
+ */
+int http3_stream_close(struct http3_conn_t *conn,
+                       struct quic_conn_t *quic_conn,
+                       uint64_t stream_id);
+
+/**
  * Set priority for an HTTP/3 stream.
  */
 int http3_stream_set_priority(struct http3_conn_t *conn,
                               struct quic_conn_t *quic_conn,
                               uint64_t stream_id,
                               const struct http3_priority_t *priority);
-
-/**
- * Close the given HTTP/3 stream.
- */
-int http3_stream_close(struct http3_conn_t *conn,
-                       struct quic_conn_t *quic_conn,
-                       uint64_t stream_id);
 
 /**
  * Send HTTP/3 request or response headers on the given stream.
@@ -934,124 +1458,17 @@ int http3_take_priority_update(struct http3_conn_t *conn,
                                void *argp);
 
 /**
- * An enum representing the available verbosity level filters of the logger.
- */
-typedef enum quic_log_level {
-  /**
-   * A level lower than all log levels.
-   */
-  QUIC_LOG_LEVEL_OFF,
-  /**
-   * Corresponds to the `Error` log level.
-   */
-  QUIC_LOG_LEVEL_ERROR,
-  /**
-   * Corresponds to the `Warn` log level.
-   */
-  QUIC_LOG_LEVEL_WARN,
-  /**
-   * Corresponds to the `Info` log level.
-   */
-  QUIC_LOG_LEVEL_INFO,
-  /**
-   * Corresponds to the `Debug` log level.
-   */
-  QUIC_LOG_LEVEL_DEBUG,
-  /**
-   * Corresponds to the `Trace` log level.
-   */
-  QUIC_LOG_LEVEL_TRACE,
-} quic_log_level;
-
-/**
  * Set logger.
  * `cb` is a callback function that will be called for each log message.
- * `line` is a null-terminated log message and `argp` is user-defined data that will be passed to
- * the callback.
- * `level` represents the log level.
+ * `data` is a '\n' terminated log message and `argp` is user-defined data that
+ * will be passed to the callback.
+ * `level` is a case-insensitive string used for specifying the log level. Valid
+ * values are "OFF", "ERROR", "WARN", "INFO", "DEBUG", and "TRACE". If its value
+ * is NULL or invalid, the default log level is "OFF".
  */
-void quic_set_logger(void (*cb)(const uint8_t *line, void *argp), void *argp, quic_log_level level);
-
-typedef enum http3_error {
-    HTTP3_NO_ERROR = 0,
-
-    // There is no error or no work to do
-    HTTP3_ERR_DONE = -1,
-
-    // The endpoint detected an error in the protocol
-    HTTP3_ERR_GENERAL_PROTOCOL_ERROR = -2,
-
-    // The endpoint encountered an internal error and cannot continue with the
-    // connection
-    HTTP3_ERR_INTERNAL_ERROR = -3,
-
-    // The endpoint detected that its peer created a stream that it will not
-    // accept
-    HTTP3_ERR_STREAM_CREATION_ERROR = -4,
-
-    // A stream required by the connection was closed or reset
-    HTTP3_ERR_CLOSED_CRITICAL_STREAM = -5,
-
-    // A frame was received which is not permitted in the current state or on
-    // the current stream
-    HTTP3_ERR_FRAME_UNEXPECTED = -6,
-
-    // A frame that fails to satisfy layout requirements or with an invalid
-    // size was received
-    HTTP3_ERR_FRAME_ERROR = -7,
-
-    // The endpoint detected that its peer is exhibiting a behavior that might
-    // be generating excessive load
-    HTTP3_ERR_EXCESSIVE_LOAD = -8,
-
-    // A stream ID or push ID was used incorrectly, such as exceeding a limit,
-    // reducing a limit, or being reused
-    HTTP3_ERR_ID_ERROR = -9,
-
-    // An endpoint detected an error in the payload of a SETTINGS frame
-    HTTP3_ERR_SETTINGS_ERROR = -10,
-
-    // No SETTINGS frame was received at the beginning of the control stream
-    HTTP3_ERR_MISSING_SETTINGS = -11,
-
-    // -12 reserved
-
-    // The stream is blocked
-    HTTP3_ERR_STREAM_BLOCKED = -13,
-
-    // The server rejected the request without performing any application
-    // processing
-    HTTP3_ERR_REQUEST_REJECTED = -14,
-
-    // The request or its response (including pushed response) is cancelled
-    HTTP3_ERR_REQUEST_CANCELLED = -15,
-
-    // The client's stream terminated without containing a fully-formed request
-    HTTP3_ERR_REQUEST_INCOMPLETE = -16,
-
-    // An HTTP message was malformed and cannot be processed
-    HTTP3_ERR_MESSAGE_ERROR = -17,
-
-    // The TCP connection established in response to a CONNECT request was
-    // reset or abnormally closed
-    HTTP3_ERR_CONNECT_ERROR = -18,
-
-    // The requested operation cannot be served over HTTP/3. The peer should
-    // retry over HTTP/1.1
-    HTTP3_ERR_VERSION_FALLBACK = -19,
-
-    // The decoder failed to interpret an encoded field section and is not
-    // able to continue decoding that field section
-    HTTP3_ERR_QPACK_DECOMPRESSION_FAILED = -20,
-
-    // The decoder failed to interpret an encoder instruction received on the
-    // encoder stream
-    HTTP3_ERR_QPACK_ENCODER_STREAM_ERROR = -21,
-
-    // The encoder failed to interpret a decoder instruction received on the
-    // decoder stream
-    HTTP3_ERR_QPACK_DECODER_STREAM_ERROR = -22,
-} http3_error;
+void quic_set_logger(void (*cb)(const uint8_t *data, size_t data_len, void *argp),
+                     void *argp,
+                     const char *level);
 
 #ifdef __cplusplus
 } // extern "C"

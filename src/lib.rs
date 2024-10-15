@@ -50,6 +50,7 @@
 
 #![allow(unused_imports)]
 #![allow(dead_code)]
+#![allow(unexpected_cfgs)]
 
 use std::cmp;
 use std::collections::VecDeque;
@@ -59,6 +60,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time;
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::Buf;
 use bytes::BufMut;
@@ -69,6 +71,7 @@ use ring::aead::UnboundKey;
 use ring::hmac;
 use rustc_hash::FxHashSet;
 
+use crate::codec::VINT_MAX;
 use crate::connection::stream;
 use crate::tls::TlsSession;
 use crate::token::ResetToken;
@@ -78,7 +81,7 @@ use crate::trans_param::TransportParams;
 pub const QUIC_VERSION: u32 = QUIC_VERSION_V1;
 
 /// The QUIC Version 1
-const QUIC_VERSION_V1: u32 = 0x0000_0001;
+pub const QUIC_VERSION_V1: u32 = 0x0000_0001;
 
 /// The Connection ID MUST NOT exceed 20 bytes in QUIC version 1.
 /// See RFC 9000 Section 17.2
@@ -92,7 +95,7 @@ const RESET_TOKEN_LEN: usize = 16;
 
 /// For the Stateless Reset to appear as a valid QUIC packet, the Unpredictable
 /// Bits field needs to include at least 38 bits of data. The minimum length of
-/// a Statless Reset Packet is 21 bytes.
+/// a Stateless Reset Packet is 21 bytes.
 const MIN_RESET_PACKET_LEN: usize = 21;
 
 /// Assuming the maximum possible connection ID and packet number size, the 1RTT
@@ -113,9 +116,6 @@ const MAX_ACK_RANGES: usize = 68;
 
 /// Default outgoing udp datagram payloads size.
 const DEFAULT_SEND_UDP_PAYLOAD_SIZE: usize = 1200;
-
-/// The maximum number of undecryptable packets that can be buffered.
-const MAX_UNDECRYPTABLE_PACKETS: usize = 10;
 
 /// An endpoint MUST limit the amount of data it sends to the unvalidated
 /// address to three times the amount of data received from that address.
@@ -153,6 +153,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Connection Id is an identifier used to identify a QUIC connection
 /// at an endpoint.
+#[repr(C)]
 #[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 pub struct ConnectionId {
     /// length of cid
@@ -212,9 +213,6 @@ pub trait ConnectionIdGenerator {
     /// Return the length of a CID
     fn cid_len(&self) -> usize;
 
-    /// Return the lifetime of CID
-    fn cid_lifetime(&self) -> Option<Duration>;
-
     /// Generate a new CID and associated reset token.
     fn generate_cid_and_token(&mut self, reset_token_key: &hmac::Key) -> (ConnectionId, u128) {
         let scid = self.generate();
@@ -227,14 +225,12 @@ pub trait ConnectionIdGenerator {
 #[derive(Debug, Clone, Copy)]
 pub struct RandomConnectionIdGenerator {
     cid_len: usize,
-    cid_lifetime: Option<Duration>,
 }
 
 impl RandomConnectionIdGenerator {
-    pub fn new(cid_len: usize, cid_lifetime: Option<Duration>) -> Self {
+    pub fn new(cid_len: usize) -> Self {
         Self {
             cid_len: cmp::min(cid_len, MAX_CID_LEN),
-            cid_lifetime,
         }
     }
 }
@@ -248,10 +244,6 @@ impl ConnectionIdGenerator for RandomConnectionIdGenerator {
 
     fn cid_len(&self) -> usize {
         self.cid_len
-    }
-
-    fn cid_lifetime(&self) -> Option<Duration> {
-        self.cid_lifetime
     }
 }
 
@@ -342,10 +334,19 @@ pub struct Config {
     /// Length of source cid.
     cid_len: usize,
 
+    /// Anti-amplification factor.
+    anti_amplification_factor: usize,
+
     /// Maximum numbers of packets sent in a batch.
     send_batch_size: usize,
 
-    /// Recovery and congestion control configurations.
+    /// Buffer size for early incoming zero rtt packets, in packets.
+    zerortt_buffer_size: usize,
+
+    /// The maximum number of undecryptable packets that can be stored by one connection, in packets.
+    max_undecryptable_packets: usize,
+
+    /// Configurations about loss recovery, congestion control, and pmtu discovery.
     recovery: RecoveryConfig,
 
     /// Multipath transport configurations.
@@ -371,7 +372,6 @@ impl Config {
     /// # Ok::<(), tquic::error::Error>(())
     /// ```
     pub fn new() -> Result<Self> {
-        // TODO: review default value
         let local_transport_params = TransportParams {
             initial_max_data: 10485760,
             initial_max_stream_data_bidi_local: 5242880,
@@ -396,7 +396,10 @@ impl Config {
             address_token_key: Self::rand_address_token_key()?,
             reset_token_key,
             cid_len: 8,
+            anti_amplification_factor: ANTI_AMPLIFICATION_FACTOR,
             send_batch_size: 64,
+            zerortt_buffer_size: 1000,
+            max_undecryptable_packets: 10,
             recovery: RecoveryConfig::default(),
             multipath: MultipathConfig::default(),
             tls_config_selector: None,
@@ -406,7 +409,7 @@ impl Config {
     /// Set the `max_idle_timeout` transport parameter in milliseconds.
     /// Idle timeout is disabled by default.
     pub fn set_max_idle_timeout(&mut self, v: u64) {
-        self.local_transport_params.max_idle_timeout = v;
+        self.local_transport_params.max_idle_timeout = cmp::min(v, VINT_MAX);
     }
 
     /// Set handshake timeout in milliseconds. Zero turns the timeout off.
@@ -418,66 +421,83 @@ impl Config {
     /// the size of UDP payloads that the endpoint is willing to receive. The
     /// default value is `65527`.
     pub fn set_recv_udp_payload_size(&mut self, v: u16) {
-        self.local_transport_params.max_udp_payload_size = v as u64;
+        self.local_transport_params.max_udp_payload_size = cmp::min(v as u64, VINT_MAX);
     }
 
-    /// Set the maximum outgoing UDP payload size.
-    /// This is depended on both the configured max payload size and the max_udp_payload_size
-    /// transport parameter advertised by the remote peer.
-    /// The default and minimum value is `1200`.
+    /// Enable the Datagram Packetization Layer Path MTU Discovery
+    /// default value is true.
+    pub fn enable_dplpmtud(&mut self, v: bool) {
+        self.recovery.enable_dplpmtud = v;
+    }
+
+    /// Set the maximum outgoing UDP payload size in bytes.
+    /// It corresponds to the maximum datagram size that DPLPMTUD tries to discovery.
+    /// The default value is `1200` which means let DPLPMTUD choose a value.
     pub fn set_send_udp_payload_size(&mut self, v: usize) {
         self.recovery.max_datagram_size = cmp::max(v, DEFAULT_SEND_UDP_PAYLOAD_SIZE);
     }
 
     /// Set the `initial_max_data` transport parameter. It means the initial
     /// value for the maximum amount of data that can be sent on the connection.
+    /// The value is capped by the setting `max_connection_window`.
     /// The default value is `10485760`.
     pub fn set_initial_max_data(&mut self, v: u64) {
-        self.local_transport_params.initial_max_data = v;
+        self.local_transport_params.initial_max_data = cmp::min(v, self.max_connection_window);
     }
 
     /// Set the `initial_max_stream_data_bidi_local` transport parameter.
+    /// The value is capped by the setting `max_stream_window`.
     /// The default value is `5242880`.
     pub fn set_initial_max_stream_data_bidi_local(&mut self, v: u64) {
         self.local_transport_params
-            .initial_max_stream_data_bidi_local = v;
+            .initial_max_stream_data_bidi_local = cmp::min(v, self.max_stream_window);
     }
 
     /// Set the `initial_max_stream_data_bidi_remote` transport parameter.
+    /// The value is capped by the setting `max_stream_window`.
     /// The default value is `2097152`.
     pub fn set_initial_max_stream_data_bidi_remote(&mut self, v: u64) {
         self.local_transport_params
-            .initial_max_stream_data_bidi_remote = v;
+            .initial_max_stream_data_bidi_remote = cmp::min(v, self.max_stream_window);
     }
 
     /// Set the `initial_max_stream_data_uni` transport parameter.
+    /// The value is capped by the setting `max_stream_window`.
     /// The default value is `1048576`.
     pub fn set_initial_max_stream_data_uni(&mut self, v: u64) {
-        self.local_transport_params.initial_max_stream_data_uni = v;
+        self.local_transport_params.initial_max_stream_data_uni =
+            cmp::min(v, self.max_stream_window);
     }
 
     /// Set the `initial_max_streams_bidi` transport parameter.
     /// The default value is `200`.
     pub fn set_initial_max_streams_bidi(&mut self, v: u64) {
-        self.local_transport_params.initial_max_streams_bidi = v;
+        self.local_transport_params.initial_max_streams_bidi = cmp::min(v, VINT_MAX);
     }
 
     /// Set the `initial_max_streams_uni` transport parameter.
     /// The default value is `100`.
     pub fn set_initial_max_streams_uni(&mut self, v: u64) {
-        self.local_transport_params.initial_max_streams_uni = v;
+        self.local_transport_params.initial_max_streams_uni = cmp::min(v, VINT_MAX);
     }
 
     /// Set the `ack_delay_exponent` transport parameter.
     /// The default value is `3`.
     pub fn set_ack_delay_exponent(&mut self, v: u64) {
-        self.local_transport_params.ack_delay_exponent = v;
+        self.local_transport_params.ack_delay_exponent = cmp::min(v, VINT_MAX);
     }
 
     /// Set the `max_ack_delay` transport parameter.
     /// The default value is `25`.
     pub fn set_max_ack_delay(&mut self, v: u64) {
-        self.local_transport_params.max_ack_delay = v;
+        self.local_transport_params.max_ack_delay = cmp::min(v, VINT_MAX);
+    }
+
+    /// Set the maximum number of ack-eliciting packets the endpoint receives before
+    /// sending an acknowledgment.
+    /// The default value is `2`.
+    pub fn set_ack_eliciting_threshold(&mut self, v: u64) {
+        self.recovery.ack_eliciting_threshold = v;
     }
 
     /// Set congestion control algorithm that the connection would use.
@@ -498,12 +518,80 @@ impl Config {
         self.recovery.min_congestion_window = packets
     }
 
+    /// Set the threshold for slow start in packets.
+    /// The default value is the maximum value of u64.
+    pub fn set_slow_start_thresh(&mut self, packets: u64) {
+        self.recovery.slow_start_thresh = packets
+    }
+
+    /// Set the minimum duration for BBR ProbeRTT state in milliseconds.
+    /// The default value is 200 milliseconds.
+    pub fn set_bbr_probe_rtt_duration(&mut self, millis: u64) {
+        self.recovery.bbr_probe_rtt_duration =
+            cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY);
+    }
+
+    /// Enable using a cwnd based on bdp during ProbeRTT state.
+    /// The default value is false.
+    pub fn enable_bbr_probe_rtt_based_on_bdp(&mut self, v: bool) {
+        self.recovery.bbr_probe_rtt_based_on_bdp = v;
+    }
+
+    /// Set the cwnd gain for BBR ProbeRTT state.
+    /// This option is meaningful only when `bbr_probe_rtt_based_on_bdp` option
+    /// is set to true.
+    /// The default value is 0.75
+    pub fn set_bbr_probe_rtt_cwnd_gain(&mut self, v: f64) {
+        self.recovery.bbr_probe_rtt_cwnd_gain = v;
+    }
+
+    /// Set the length of the BBR RTProp min filter window in milliseconds.
+    /// The default value is 10000 milliseconds.
+    pub fn set_bbr_rtprop_filter_len(&mut self, millis: u64) {
+        self.recovery.bbr_rtprop_filter_len =
+            cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY);
+    }
+
+    /// Set the cwnd gain for BBR ProbeBW state.
+    /// The default value is 2.0
+    pub fn set_bbr_probe_bw_cwnd_gain(&mut self, v: f64) {
+        self.recovery.bbr_probe_bw_cwnd_gain = v;
+    }
+
+    /// Set the delta in copa slow start state.
+    pub fn set_copa_slow_start_delta(&mut self, v: f64) {
+        self.recovery.copa_slow_start_delta = v;
+    }
+
+    /// Set the delta in coap steady state.
+    pub fn set_copa_steady_delta(&mut self, v: f64) {
+        self.recovery.copa_steady_delta = v;
+    }
+
+    /// Enable Using the rtt standing instead of the latest rtt to calculate queueing delay.
+    pub fn enable_copa_use_standing_rtt(&mut self, v: bool) {
+        self.recovery.copa_use_standing_rtt = v;
+    }
+
     /// Set the initial RTT in milliseconds. The default value is 333ms.
     ///
     /// The configuration should be changed with caution. Setting a value less than the default
     /// will cause retransmission of handshake packets to be more aggressive.
     pub fn set_initial_rtt(&mut self, millis: u64) {
         self.recovery.initial_rtt = cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY);
+    }
+
+    /// Enable pacing to smooth the flow of packets sent onto the network.
+    /// The default value is true.
+    pub fn enable_pacing(&mut self, v: bool) {
+        self.recovery.enable_pacing = v;
+    }
+
+    /// Set clock granularity used by the pacer.
+    /// The default value is 1 milliseconds.
+    pub fn set_pacing_granularity(&mut self, millis: u64) {
+        self.recovery.pacing_granularity =
+            cmp::max(Duration::from_millis(millis), TIMER_GRANULARITY);
     }
 
     /// Set the linear factor for calculating the probe timeout.
@@ -527,7 +615,7 @@ impl Config {
     /// The default value is `2`. Lower values will be ignored.
     pub fn set_active_connection_id_limit(&mut self, v: u64) {
         if v >= 2 {
-            self.local_transport_params.active_conn_id_limit = v;
+            self.local_transport_params.active_conn_id_limit = cmp::min(v, VINT_MAX);
         }
     }
 
@@ -539,20 +627,21 @@ impl Config {
 
     /// Set the multipath scheduling algorithm
     /// The default value is MultipathAlgorithm::MinRtt
-    pub fn set_multipath_algor(&mut self, v: MultipathAlgorithm) {
-        self.multipath.multipath_algor = v;
+    pub fn set_multipath_algorithm(&mut self, v: MultipathAlgorithm) {
+        self.multipath.multipath_algorithm = v;
     }
 
     /// Set the maximum size of the connection flow control window.
-    /// The default value is MAX_CONNECTION_WINDOW.
+    /// The default value is MAX_CONNECTION_WINDOW (15 MB).
     pub fn set_max_connection_window(&mut self, v: u64) {
-        self.max_connection_window = v;
+        self.max_connection_window = cmp::min(v, VINT_MAX);
     }
 
     /// Set the maximum size of the stream flow control window.
-    /// The default value is MAX_STREAM_WINDOW.
+    /// The value should not be greater than the setting `max_connection_window`.
+    /// The default value is MAX_STREAM_WINDOW (6 MB).
     pub fn set_max_stream_window(&mut self, v: u64) {
-        self.max_stream_window = v;
+        self.max_stream_window = cmp::min(v, VINT_MAX);
     }
 
     /// Set the maximum number of concurrent connections.
@@ -561,23 +650,21 @@ impl Config {
         self.max_concurrent_conns = v;
     }
 
-    /// Set whether stateless reset is allowed.
-    pub fn enable_stateless_reset(&mut self, enable_stateless_reset: bool) {
-        self.stateless_reset = enable_stateless_reset;
-    }
-
-    /// Set the key for reset token generation
+    /// Set the key for reset token generation.
+    /// Applicable to Server only.
     pub fn set_reset_token_key(&mut self, v: [u8; 64]) {
         // HMAC-SHA256 use a 512-bit block length
         self.reset_token_key = hmac::Key::new(hmac::HMAC_SHA256, &v);
     }
 
-    /// Set whether stateless retry is allowed. Default is not allowed.
-    pub fn enable_retry(&mut self, enable_retry: bool) {
-        self.retry = enable_retry;
+    /// Set the lifetime of address token.
+    /// Applicable to Server only.
+    pub fn set_address_token_lifetime(&mut self, seconds: u64) {
+        self.address_token_lifetime = Duration::from_secs(seconds);
     }
 
     /// Set the key for address token generation.
+    /// Applicable to Server only.
     pub fn set_address_token_key(&mut self, keys: Vec<[u8; 16]>) -> Result<()> {
         if keys.is_empty() {
             return Err(Error::InvalidConfig("address token key empty".into()));
@@ -595,19 +682,65 @@ impl Config {
         Ok(())
     }
 
-    /// Set the lifetime of address token
-    pub fn set_address_token_lifetime(&mut self, seconds: u64) {
-        self.address_token_lifetime = Duration::from_secs(seconds);
+    /// Set whether stateless retry is allowed. Default is not allowed.
+    /// Applicable to Server only.
+    pub fn enable_retry(&mut self, enable_retry: bool) {
+        self.retry = enable_retry;
+    }
+
+    /// Set whether stateless reset is allowed.
+    /// Applicable to Endpoint only.
+    pub fn enable_stateless_reset(&mut self, enable_stateless_reset: bool) {
+        self.stateless_reset = enable_stateless_reset;
     }
 
     /// Set the length of source cid.
+    /// Applicable to Endpoint only.
     pub fn set_cid_len(&mut self, v: usize) {
         self.cid_len = cmp::min(v, MAX_CID_LEN);
     }
 
+    /// Set the anti-amplification factor.
+    ///
+    /// The server limits the data sent to an unvalidated address to
+    /// `anti_amplification_factor` times the received data.
+    pub fn set_anti_amplification_factor(&mut self, v: usize) {
+        self.anti_amplification_factor = cmp::max(v, ANTI_AMPLIFICATION_FACTOR);
+    }
+
     /// Set the batch size for sending packets.
+    /// Applicable to Endpoint only.
     pub fn set_send_batch_size(&mut self, v: usize) {
         self.send_batch_size = cmp::max(v, 1);
+    }
+
+    /// Set the buffer size for disordered zerortt packets on the server.
+    /// The default value is `1000`. A value of 0 will be treated as default value.
+    /// Applicable to Server only.
+    pub fn set_zerortt_buffer_size(&mut self, v: usize) {
+        if v > 0 {
+            self.zerortt_buffer_size = v;
+        } else {
+            self.zerortt_buffer_size = 1000;
+        }
+    }
+
+    /// Set the maximum number of undecryptable packets that can be stored by one connection.
+    /// The default value is `10`. A value of 0 will be treated as default value.
+    pub fn set_max_undecryptable_packets(&mut self, v: usize) {
+        if v > 0 {
+            self.max_undecryptable_packets = v;
+        } else {
+            self.max_undecryptable_packets = 10;
+        }
+    }
+
+    /// Enable or disable encryption on 1-RTT packets. (Experimental)
+    /// The default value is true.
+    /// WARN: The The disable_1rtt_encryption extension is not meant to be used
+    /// for any practical application protocol on the open internet.
+    pub fn enable_encryption(&mut self, v: bool) {
+        self.local_transport_params.disable_encryption = !v;
     }
 
     /// Set TLS config.
@@ -646,16 +779,23 @@ impl Config {
     }
 }
 
-/// Configurations about loss recovery and congestion control.
+/// Configurations about loss recovery, congestion control, and pmtu discovery.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
+    /// Enable Datagram Packetization Layer Path MTU Discovery.
+    pub enable_dplpmtud: bool,
+
     /// The maximum size of outgoing UDP payloads.
     pub max_datagram_size: usize,
 
     /// The maximum amount of time the endpoint intends to delay acknowledgments
     /// for packets in the Application Data packet number space.
     max_ack_delay: Duration,
+
+    /// The maximum number of ack-eliciting packets the endpoint receives before
+    /// sending an acknowledgment.
+    ack_eliciting_threshold: u64,
 
     /// The congestion control algorithm used for a path.
     pub congestion_control_algorithm: CongestionControlAlgorithm,
@@ -672,25 +812,71 @@ pub struct RecoveryConfig {
     /// See RFC 9002 Section 7.2
     pub initial_congestion_window: u64,
 
+    /// The threshold for slow start in packets.
+    pub slow_start_thresh: u64,
+
+    /// The minimum duration for BBR ProbeRTT state
+    pub bbr_probe_rtt_duration: Duration,
+
+    /// Enable using a cwnd based on bdp during ProbeRTT state.
+    pub bbr_probe_rtt_based_on_bdp: bool,
+
+    /// The cwnd gain for BBR ProbeRTT state
+    pub bbr_probe_rtt_cwnd_gain: f64,
+
+    /// The length of the RTProp min filter window
+    pub bbr_rtprop_filter_len: Duration,
+
+    /// The cwnd gain for ProbeBW state
+    pub bbr_probe_bw_cwnd_gain: f64,
+
+    /// Delta in copa slow start state.
+    pub copa_slow_start_delta: f64,
+
+    /// Delta in coap steady state.
+    pub copa_steady_delta: f64,
+
+    /// Use rtt standing instead of latest rtt to calculate queueing delay
+    pub copa_use_standing_rtt: bool,
+
     /// The initial rtt, used before real rtt is estimated.
     pub initial_rtt: Duration,
+
+    /// Enable pacing to smooth the flow of packets sent onto the network.
+    pub enable_pacing: bool,
+
+    /// Clock granularity used by the pacer.
+    pub pacing_granularity: Duration,
 
     /// Linear factor for calculating the probe timeout.
     pub pto_linear_factor: u64,
 
-    // Upper limit of probe timeout.
+    /// Upper limit of probe timeout.
     pub max_pto: Duration,
 }
 
 impl Default for RecoveryConfig {
     fn default() -> RecoveryConfig {
         RecoveryConfig {
-            max_datagram_size: 1200,
+            enable_dplpmtud: true,
+            max_datagram_size: DEFAULT_SEND_UDP_PAYLOAD_SIZE, // The upper limit is determined by DPLPMTUD
             max_ack_delay: time::Duration::from_millis(0),
+            ack_eliciting_threshold: 2,
             congestion_control_algorithm: CongestionControlAlgorithm::Bbr,
             min_congestion_window: 2_u64,
             initial_congestion_window: 10_u64,
+            slow_start_thresh: u64::MAX,
+            bbr_probe_rtt_duration: Duration::from_millis(200),
+            bbr_probe_rtt_based_on_bdp: false,
+            bbr_probe_rtt_cwnd_gain: 0.75,
+            bbr_rtprop_filter_len: Duration::from_secs(10),
+            bbr_probe_bw_cwnd_gain: 2.0,
+            copa_slow_start_delta: congestion_control::COPA_DELTA,
+            copa_steady_delta: congestion_control::COPA_DELTA,
+            copa_use_standing_rtt: true,
             initial_rtt: INITIAL_RTT,
+            enable_pacing: true,
+            pacing_granularity: time::Duration::from_millis(1),
             pto_linear_factor: DEFAULT_PTO_LINEAR_FACTOR,
             max_pto: MAX_PTO,
         }
@@ -702,13 +888,13 @@ impl Default for RecoveryConfig {
 #[derive(Debug, Clone)]
 pub struct MultipathConfig {
     /// Multipath scheduling algorithm.
-    multipath_algor: MultipathAlgorithm,
+    multipath_algorithm: MultipathAlgorithm,
 }
 
 impl Default for MultipathConfig {
     fn default() -> MultipathConfig {
         MultipathConfig {
-            multipath_algor: MultipathAlgorithm::MinRtt,
+            multipath_algorithm: MultipathAlgorithm::MinRtt,
         }
     }
 }
@@ -753,7 +939,7 @@ impl EventQueue {
         self.0 = Some(VecDeque::new());
     }
 
-    /// Add a endpoint-faceing event.
+    /// Add an endpoint-faceing event.
     fn add(&mut self, e: Event) -> bool {
         if let Some(events) = &mut self.0 {
             events.push_back(e);
@@ -762,7 +948,7 @@ impl EventQueue {
         false
     }
 
-    /// Return a endpoint-facing event.
+    /// Return an endpoint-facing event.
     fn poll(&mut self) -> Option<Event> {
         if let Some(events) = &mut self.0 {
             return events.pop_front();
@@ -866,6 +1052,87 @@ pub enum Shutdown {
     Write = 1,
 }
 
+/// Important events about path
+pub enum PathEvent {
+    /// The path has been validated.
+    Validated(usize),
+
+    /// The path has been abandoned.
+    Abandoned(usize),
+}
+
+/// Statistics about path
+#[repr(C)]
+#[derive(Default)]
+pub struct PathStats {
+    /// The number of QUIC packets received.
+    pub recv_count: u64,
+
+    /// The number of received bytes.
+    pub recv_bytes: u64,
+
+    /// The number of QUIC packets sent.
+    pub sent_count: u64,
+
+    /// The number of sent bytes.
+    pub sent_bytes: u64,
+
+    /// The number of QUIC packets lost.
+    pub lost_count: u64,
+
+    /// The number of lost bytes.
+    pub lost_bytes: u64,
+
+    /// Total number of packets acked.
+    pub acked_count: u64,
+
+    /// Total number of bytes acked.
+    pub acked_bytes: u64,
+
+    /// Initial congestion window in bytes.
+    pub init_cwnd: u64,
+
+    /// Final congestion window in bytes.
+    pub final_cwnd: u64,
+
+    /// Maximum congestion window in bytes.
+    pub max_cwnd: u64,
+
+    /// Minimum congestion window in bytes.
+    pub min_cwnd: u64,
+
+    /// Maximum inflight data in bytes.
+    pub max_inflight: u64,
+
+    /// Total loss events.
+    pub loss_event_count: u64,
+
+    /// Total congestion window limited events.
+    pub cwnd_limited_count: u64,
+
+    /// Total duration of congestion windowlimited events in microseconds.
+    pub cwnd_limited_duration: u64,
+
+    /* Note: the following fields are lazily updated from Recovery */
+    /// Minimum roundtrip time in microseconds.
+    pub min_rtt: u64,
+
+    /// Maximum roundtrip time in microseconds.
+    pub max_rtt: u64,
+
+    /// Smoothed roundtrip time in microseconds.
+    pub srtt: u64,
+
+    /// Roundtrip time variation in microseconds.
+    pub rttvar: u64,
+
+    /// Whether the congestion controller is in slow start status.
+    pub in_slow_start: bool,
+
+    /// Pacing rate estimated by congestion control algorithm.
+    pub pacing_rate: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -874,17 +1141,16 @@ mod tests {
     fn init() {
         env_logger::builder()
             .filter_level(log::LevelFilter::Trace)
+            .format_timestamp_millis()
             .is_test(true)
             .init();
     }
 
     #[test]
     fn connection_id() {
-        let lifetime = Duration::from_secs(3600);
-        let mut cid_gen = RandomConnectionIdGenerator::new(8, Some(lifetime));
+        let mut cid_gen = RandomConnectionIdGenerator::new(8);
         let cid = cid_gen.generate();
         assert_eq!(cid.len(), cid_gen.cid_len());
-        assert_eq!(Some(lifetime), cid_gen.cid_lifetime());
 
         let cid = ConnectionId {
             len: 4,
@@ -933,6 +1199,18 @@ mod tests {
 
         Ok(())
     }
+
+    #[test]
+    fn initial_max_streams_bidi() -> Result<()> {
+        let mut config = Config::new()?;
+        config.set_initial_max_streams_bidi(u64::MAX);
+        assert_eq!(
+            config.local_transport_params.initial_max_streams_bidi,
+            VINT_MAX
+        );
+
+        Ok(())
+    }
 }
 
 pub use crate::congestion_control::CongestionControlAlgorithm;
@@ -941,8 +1219,9 @@ pub use crate::connection::Connection;
 pub use crate::endpoint::Endpoint;
 pub use crate::error::Error;
 pub use crate::multipath_scheduler::MultipathAlgorithm;
-#[doc(hidden)]
+pub use crate::packet::PacketHeader;
 pub use crate::tls::TlsConfig;
+pub use crate::tls::TlsConfigSelector;
 
 #[path = "connection/connection.rs"]
 pub mod connection;
@@ -964,6 +1243,12 @@ mod qlog;
 
 #[cfg(feature = "ffi")]
 mod ffi;
+
+// Note: Workaround for the module path issue in cbindgen.
+// DON'T enable this feature when building with cargo.
+#[cfg(feature = "cbindgen")]
+#[path = "h3/connection.rs"]
+mod h3_connection;
 
 mod codec;
 pub mod endpoint;

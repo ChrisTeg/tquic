@@ -38,6 +38,7 @@ use super::minmax::MinMax;
 use super::{CongestionController, CongestionStats};
 use crate::connection::rtt::RttEstimator;
 use crate::connection::space::{RateSamplePacketState, SentPacket};
+use crate::RecoveryConfig;
 
 /// BBR configurable parameters.
 #[derive(Debug)]
@@ -82,16 +83,17 @@ pub struct Bbr3Config {
 }
 
 impl Bbr3Config {
-    pub fn new(
-        min_cwnd: u64,
-        initial_cwnd: u64,
-        initial_rtt: Option<Duration>,
-        max_datagram_size: u64,
-    ) -> Self {
+    pub fn from(conf: &RecoveryConfig) -> Self {
+        let max_datagram_size = conf.max_datagram_size as u64;
+        let min_cwnd = conf.min_congestion_window.saturating_mul(max_datagram_size);
+        let initial_cwnd = conf
+            .initial_congestion_window
+            .saturating_mul(max_datagram_size);
+
         Self {
             min_cwnd,
             initial_cwnd,
-            initial_rtt,
+            initial_rtt: Some(conf.initial_rtt),
             max_datagram_size,
             ..Self::default()
         }
@@ -1463,7 +1465,8 @@ impl Bbr3 {
     //
     // See <https://www.ietf.org/archive/id/draft-cardwell-iccrg-bbr-congestion-control-02.html#name-probing-for-bandwidth-in-pr>.
     fn handle_lost_packet(&mut self, now: Instant, packet: &SentPacket) {
-        if !self.bw_probe_samples {
+        // In startup phase we need to update stats upon every ack reception
+        if !self.bw_probe_samples && !self.in_slow_start() {
             // not a packet sent while probing bandwidth.
             return;
         }
@@ -1849,8 +1852,8 @@ impl CongestionController for Bbr3 {
             self.stats.bytes_lost_in_total,
         );
 
-        self.stats.bytes_in_flight += packet.sent_size as u64;
         self.handle_restart_from_idle(now, self.stats.bytes_in_flight);
+        self.stats.bytes_in_flight += packet.sent_size as u64;
     }
 
     fn begin_ack(&mut self, now: Instant, bytes_in_flight: u64) {

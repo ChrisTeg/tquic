@@ -32,6 +32,11 @@ use log::*;
 use strum::IntoEnumIterator;
 
 use self::cid::ConnectionIdItem;
+use self::space::BufferFlags;
+use self::space::BufferType;
+use self::space::PacketNumSpace;
+use self::space::RateSamplePacketState;
+use self::space::SpaceId;
 use self::stream::Stream;
 use self::stream::StreamIter;
 use self::timer::Timer;
@@ -39,7 +44,6 @@ use self::ConnectionFlags::*;
 use crate::codec;
 use crate::codec::Decoder;
 use crate::codec::Encoder;
-use crate::connection::space::RateSamplePacketState;
 use crate::error::ConnectionError;
 use crate::error::Error;
 use crate::frame;
@@ -51,7 +55,9 @@ use crate::packet::PacketType;
 use crate::qlog;
 use crate::qlog::events;
 use crate::tls;
+use crate::tls::Keys;
 use crate::tls::Level;
+use crate::tls::Open;
 use crate::tls::TlsSession;
 use crate::token::AddressToken;
 use crate::token::ResetToken;
@@ -65,11 +71,11 @@ use crate::FourTuple;
 use crate::FourTupleIter;
 use crate::MultipathConfig;
 use crate::PacketInfo;
+use crate::PathEvent;
+use crate::PathStats;
 use crate::RecoveryConfig;
 use crate::Result;
 use crate::Shutdown;
-
-use self::space::SpaceId;
 
 /// A QUIC connection.
 pub struct Connection {
@@ -105,7 +111,7 @@ pub struct Connection {
     crypto_streams: Rc<RefCell<CryptoStreams>>,
 
     /// Raw packets that were received before decryption keys are available.
-    undecryptable_pkts: VecDeque<(Vec<u8>, PacketInfo)>,
+    undecryptable_packets: UndecryptablePackets,
 
     /// Peer transport parameters.
     peer_transport_params: TransportParams,
@@ -203,7 +209,7 @@ impl Connection {
 
         let mut path = path::Path::new(local, remote, true, &conf.recovery, &trace_id);
         if is_server {
-            // The server connection is created upon receiving a Initial packet
+            // The server connection is created upon receiving an Initial packet
             // with a valid token sent by the client.
             path.verified_peer_address = addr_token.is_some();
             // The server connection assumes the peer has validate the server's
@@ -212,7 +218,7 @@ impl Connection {
         }
 
         let cid_limit = conf.local_transport_params.active_conn_id_limit as usize;
-        let paths = path::PathMap::new(path, cid_limit, is_server);
+        let paths = path::PathMap::new(path, cid_limit, conf.anti_amplification_factor, is_server);
 
         let active_pid = paths.get_active_path_id()?;
         let reset_token = if is_server && conf.stateless_reset {
@@ -250,7 +256,7 @@ impl Connection {
             streams,
             tls_session,
             crypto_streams: Rc::new(RefCell::new(CryptoStreams::new())),
-            undecryptable_pkts: VecDeque::new(),
+            undecryptable_packets: UndecryptablePackets::new(conf.max_undecryptable_packets),
             peer_transport_params: TransportParams::default(),
             local_transport_params: conf.local_transport_params.clone(),
             recovery_conf: conf.recovery.clone(),
@@ -358,30 +364,27 @@ impl Connection {
         description: String,
     ) {
         let trace = qlog::TraceSeq::new(
-            qlog::VantagePoint::new(None, self.is_server),
             Some(title.to_string()),
             Some(description.to_string()),
-            Some(qlog::Configuration::default()),
             None,
+            qlog::VantagePoint::new(None, self.is_server),
         );
         let level = events::EventImportance::Extra;
         let mut writer = qlog::QlogWriter::new(
-            qlog::QLOG_VERSION.to_string(),
             Some(title),
             Some(description),
-            None,
-            time::Instant::now(),
             trace,
             level,
             writer,
+            time::Instant::now(),
         );
         writer.start().ok();
 
         // Write TransportParametersSet event to qlog
-        Self::qlog_transport_params_set(
+        Self::qlog_quic_params_set(
             &mut writer,
             &self.local_transport_params,
-            events::TransportOwner::Local,
+            events::Owner::Local,
             self.tls_session.cipher(),
         );
 
@@ -391,7 +394,7 @@ impl Connection {
     /// Process an incoming UDP datagram from the peer.
     ///
     /// On success the number of bytes processed is returned. On error the
-    /// connection will be closed with a error code.
+    /// connection will be closed with an error code.
     #[doc(hidden)]
     pub fn recv(&mut self, buf: &mut [u8], info: &PacketInfo) -> Result<usize> {
         let len = buf.len();
@@ -411,8 +414,9 @@ impl Connection {
             );
             return Ok(len);
         }
-        if let Some(p) = pid {
-            // TODO: server: limit bytes sent before address validation
+        if let Some(pid) = pid {
+            // Update send limit before address validation for server
+            self.paths.inc_anti_ampl_limit(pid, len);
         }
 
         // Process each QUIC packet in the UDP datagram
@@ -430,8 +434,10 @@ impl Connection {
             left -= read;
         }
 
-        // Try to process undecryptable 0-RTT packets
-        self.try_process_undecryptable_packets()?;
+        // Try to process undecryptable packets
+        if !self.is_established() {
+            self.try_process_undecryptable_packets();
+        }
 
         Ok(len - left)
     }
@@ -494,7 +500,7 @@ impl Connection {
             buf.len() - read
         } else {
             let mut b = &buf[read..];
-            let len = b.read_varint()?;
+            let len = b.read_varint().map_err(|_| Error::Done)?;
             read = buf.len() - b.len();
             // Make sure the length field is valid.
             if len > b.len() as u64 {
@@ -516,26 +522,17 @@ impl Connection {
         let key = match &key.open {
             Some(open) => open,
             None => {
-                // Buffer undecryptable packets when the key is not yet available.
-                if hdr.pkt_type == PacketType::ZeroRTT
-                    && !self.is_established()
-                    && self.undecryptable_pkts.len() < crate::MAX_UNDECRYPTABLE_PACKETS
-                {
-                    let pkt = buf[..read + length].to_vec();
-                    self.undecryptable_pkts.push_back((pkt, *info));
-                } else {
-                    trace!(
-                        "{} key not yet available, drop packet {:?}",
-                        self.trace_id,
-                        hdr
-                    );
-                }
-                return Err(Error::Done);
+                let pkt = buf[..read + length].to_vec();
+                self.try_buffer_undecryptable_packets(&hdr, pkt, info);
+                return Ok(read + length);
             }
         };
-        packet::decrypt_header(buf, pkt_num_offset, &mut hdr, key).map_err(|_| Error::Done)?;
+        let is_encryption_disabled = self.is_encryption_disabled(hdr.pkt_type);
+        packet::decrypt_header(buf, pkt_num_offset, &mut hdr, key, is_encryption_disabled)
+            .map_err(|_| Error::Done)?;
 
         // Decode packet sequence number
+        let handshake_confirmed = self.is_confirmed();
         let space_id = self.get_space_id(hdr.pkt_type, pid)?;
         let space = self.spaces.get_mut(space_id).ok_or(Error::InternalError)?;
         let largest_rx_pkt_num = space.largest_rx_pkt_num;
@@ -551,11 +548,9 @@ impl Connection {
             return Err(Error::Done);
         }
 
-        // Decrypt packet payload
+        // Select key and decrypt packet payload.
         let payload_offset = pkt_num_offset + hdr.pkt_num_len;
-        let payload_len = length
-            .checked_sub(hdr.pkt_num_len)
-            .ok_or(Error::InvalidPacket)?;
+        let payload_len = length.checked_sub(hdr.pkt_num_len).ok_or(Error::Done)?;
         let mut cid_seq = None;
         if self.flags.contains(EnableMultipath) {
             let (seq, _) = self
@@ -564,9 +559,19 @@ impl Connection {
                 .ok_or(Error::InvalidState("unknown dcid".into()))?;
             cid_seq = Some(seq as u32)
         }
-        let mut payload =
+
+        let (key, attempt_key_update) = self.tls_session.select_key(
+            handshake_confirmed,
+            self.flags.contains(EnableMultipath),
+            &hdr,
+            space,
+        )?;
+        let mut payload = if !is_encryption_disabled {
             packet::decrypt_payload(buf, payload_offset, payload_len, cid_seq, pkt_num, key)
-                .map_err(|_| Error::Done)?;
+                .map_err(|_| Error::Done)?
+        } else {
+            bytes::Bytes::copy_from_slice(&buf[payload_offset..payload_offset + payload_len])
+        };
         if payload.is_empty() {
             // An endpoint MUST treat receipt of a packet containing no frames as a connection error
             // of type PROTOCOL_VIOLATION.
@@ -581,6 +586,16 @@ impl Connection {
             pkt_num,
             self.paths.get(pid)?
         );
+
+        // Try to update key.
+        self.tls_session.try_update_key(
+            &mut self.timers,
+            space,
+            attempt_key_update,
+            &hdr,
+            now,
+            self.paths.max_pto(),
+        )?;
 
         // Update dcid for initial path
         self.try_set_dcid_for_initial_path(pid, &hdr)?;
@@ -606,9 +621,15 @@ impl Connection {
             let _ = payload.split_to(len);
         }
 
-        // Write TransportPacketReceived event to qlog.
+        // Write events to qlog.
         if let Some(qlog) = &mut self.qlog {
-            Self::qlog_transport_packet_received(qlog, &hdr, pkt_num, read, payload_len, qframes);
+            // Write TransportPacketReceived event to qlog.
+            Self::qlog_quic_packet_received(qlog, &hdr, pkt_num, read, payload_len, qframes);
+
+            // Write RecoveryMetricsUpdate event to qlog.
+            if let Ok(path) = self.paths.get_mut(pid) {
+                path.recovery.qlog_recovery_metrics_updated(qlog);
+            }
         }
 
         // Process acknowledged frames.
@@ -625,13 +646,18 @@ impl Connection {
         }
         space.recv_pkt_num_win.insert(pkt_num);
         space.recv_pkt_num_need_ack.add_elem(pkt_num);
-        space.need_send_ack = space.need_send_ack || ack_eliciting_pkt;
         space.largest_rx_pkt_num = cmp::max(space.largest_rx_pkt_num, pkt_num);
         if !probing_pkt {
             space.largest_rx_non_probing_pkt_num =
                 cmp::max(space.largest_rx_non_probing_pkt_num, pkt_num);
             // TODO: try to do connection migration
         }
+        if ack_eliciting_pkt {
+            space.largest_rx_ack_eliciting_pkt_num =
+                cmp::max(space.largest_rx_ack_eliciting_pkt_num, pkt_num);
+        }
+
+        self.try_schedule_ack_frame(space_id, pkt_num, ack_eliciting_pkt)?;
 
         // An endpoint restarts its idle timer when a packet from its peer is
         // received and processed successfully.
@@ -643,8 +669,10 @@ impl Connection {
         // Update statistic metrics
         self.stats.recv_count += 1;
         self.stats.recv_bytes += read as u64;
-        self.paths.get_mut(pid)?.stats.recv_count += 1;
-        self.paths.get_mut(pid)?.stats.recv_bytes += read as u64;
+        self.paths
+            .get_mut(pid)?
+            .recovery
+            .stat_recv_event(1, read as u64);
 
         // The successful use of Handshake packets indicates that no more
         // Initial packets need to be exchanged, as these keys can only be
@@ -665,8 +693,6 @@ impl Connection {
 
         self.flags.insert(NeedSendAckEliciting);
 
-        // TODO: notify pacer on the path
-
         Ok(read)
     }
 
@@ -683,7 +709,7 @@ impl Connection {
         match frame {
             Frame::Paddings { .. } => (), // just ignore
 
-            Frame::Ping => (), // just ignore
+            Frame::Ping { .. } => (), // just ignore
 
             Frame::Ack {
                 ack_delay,
@@ -724,10 +750,11 @@ impl Connection {
                     space_id,
                     &mut self.spaces,
                     handshake_status,
+                    self.qlog.as_mut(),
                     now,
                 )?;
                 self.stats.lost_count += lost_pkts;
-                self.stats.lost_bytes += lost_bytes as u64;
+                self.stats.lost_bytes += lost_bytes;
 
                 // An endpoint MUST discard its Handshake keys when the TLS
                 // handshake is confirmed.
@@ -842,7 +869,12 @@ impl Connection {
             }
 
             Frame::PathResponse { data } => {
-                self.paths.on_path_resp_received(path_id, data);
+                if self.paths.on_path_resp_received(path_id, data) {
+                    // Notify the path event to the multipath scheduler
+                    if let Some(ref mut scheduler) = self.multipath_scheduler {
+                        scheduler.on_path_updated(&mut self.paths, PathEvent::Validated(path_id));
+                    }
+                }
             }
 
             frame::Frame::PathAbandon {
@@ -984,7 +1016,7 @@ impl Connection {
 
         let mut found_version = 0;
         while !payload.is_empty() {
-            let version = payload.read_u32()?;
+            let version = payload.read_u32().map_err(|_| Error::Done)?;
             if crate::version_is_supported(version) {
                 found_version = cmp::max(found_version, version);
             }
@@ -1046,7 +1078,7 @@ impl Connection {
             return Err(Error::Done);
         }
 
-        self.token = pkt_hdr.token.clone();
+        self.token.clone_from(&pkt_hdr.token);
         self.flags.insert(DidRetry);
         self.flags.remove(GotPeerCid);
 
@@ -1099,8 +1131,8 @@ impl Connection {
         if self.tls_session.is_completed() {
             self.flags.insert(HandshakeCompleted);
             self.events.add(Event::ConnectionEstablished);
-            self.undecryptable_pkts.clear();
             self.timers.stop(Timer::Handshake);
+            self.try_process_undecryptable_packets();
 
             if self.is_server {
                 // The TLS handshake is considered confirmed at the server when
@@ -1128,7 +1160,7 @@ impl Connection {
                 self.multipath_scheduler = Some(build_multipath_scheduler(&self.multipath_conf));
                 self.paths.enable_multipath();
                 self.flags.insert(EnableMultipath);
-                trace!("{} enable multipath", &self.trace_id);
+                debug!("{} enable multipath", &self.trace_id);
             }
 
             // Prepare for sending NEW_CONNECTION_ID/NEW_TOKEN frames.
@@ -1160,15 +1192,24 @@ impl Connection {
             self.events.add(Event::ResetTokenAdvertised(reset_token));
         }
 
+        // The connection enters disable_1rtt_encryption mode
+        if peer_params.disable_encryption && self.local_transport_params.disable_encryption {
+            self.flags.insert(DisableEncryption);
+            debug!(
+                "{} encryption on 1-RTT packets has been negotiated to be disabled",
+                self.trace_id
+            );
+        }
+
         self.set_peer_trans_params(peer_params)?;
         self.flags.insert(AppliedPeerTransportParams);
 
         // Write TransportParametersSet event to qlog.
         if let Some(qlog) = &mut self.qlog {
-            Self::qlog_transport_params_set(
+            Self::qlog_quic_params_set(
                 qlog,
                 &self.peer_transport_params,
-                events::TransportOwner::Remote,
+                events::Owner::Remote,
                 self.tls_session.cipher(),
             );
         }
@@ -1194,7 +1235,7 @@ impl Connection {
         let max_datagram_size = peer_params.max_udp_payload_size as usize;
         active_path
             .recovery
-            .update_max_datagram_size(max_datagram_size);
+            .update_max_datagram_size(max_datagram_size, true);
 
         self.cids.set_scid_limit(peer_params.active_conn_id_limit);
 
@@ -1221,18 +1262,128 @@ impl Connection {
         }
     }
 
-    /// A server could receive packets protected with 0-RTT keys prior to
-    /// receiving a TLS ClientHello. The server MAY retain these packets for
-    /// later decryption in anticipation of receiving a ClientHello.
-    /// See RFC 9001 Section 5.7
-    fn try_process_undecryptable_packets(&mut self) -> Result<()> {
-        if self.tls_session.get_keys(Level::ZeroRTT).open.is_some() {
-            while let Some((mut pkt, info)) = self.undecryptable_pkts.pop_front() {
+    /// Try to buffer undecryptable packets when the keys are not yet available.
+    fn try_buffer_undecryptable_packets(
+        &mut self,
+        hdr: &PacketHeader,
+        pkt: Vec<u8>,
+        info: &PacketInfo,
+    ) {
+        if self.is_established()
+            || (self.is_server
+                && hdr.pkt_type != PacketType::ZeroRTT
+                && hdr.pkt_type != PacketType::OneRTT)
+            || (!self.is_server
+                && hdr.pkt_type != PacketType::Handshake
+                && hdr.pkt_type != PacketType::OneRTT)
+        {
+            trace!("{} drop packet {:?}", self.trace_id, hdr);
+            return;
+        }
+
+        if self.undecryptable_packets.push(&hdr.pkt_type, pkt, info) {
+            trace!("{} buffer undecryptable packets: {:?}", self.trace_id, hdr);
+        } else {
+            trace!(
+                "{} key not yet available, drop packet {:?}",
+                self.trace_id,
+                hdr
+            );
+        }
+    }
+
+    /// Try to process undecryptable packets.
+    fn try_process_undecryptable_packets(&mut self) {
+        if self.undecryptable_packets.all_empty() {
+            return;
+        }
+
+        let pkt_types = if self.is_server {
+            vec![PacketType::ZeroRTT, PacketType::OneRTT]
+        } else {
+            vec![PacketType::Handshake, PacketType::OneRTT]
+        };
+
+        for pkt_type in pkt_types {
+            if self.undecryptable_packets.is_empty(&pkt_type) {
+                continue;
+            }
+
+            let level = pkt_type.to_level().unwrap();
+            let key = self.tls_session.get_keys(level);
+            if key.open.is_none() {
+                continue;
+            }
+
+            while let Some((mut pkt, info)) = self.undecryptable_packets.pop(&pkt_type) {
                 if let Err(e) = self.recv(&mut pkt, &info) {
-                    self.undecryptable_pkts.clear();
-                    return Err(e);
+                    error!(
+                        "{} try process undecryptable packet error {:?} type {:?}",
+                        self.trace_id, e, pkt_type
+                    );
                 }
             }
+        }
+    }
+
+    /// Check and schedule an ACK frame to acknowledge incoming packets.
+    fn try_schedule_ack_frame(
+        &mut self,
+        space_id: SpaceId,
+        pkt_num: u64,
+        ack_eliciting: bool,
+    ) -> Result<()> {
+        if !ack_eliciting {
+            return Ok(());
+        }
+
+        let space = self.spaces.get_mut(space_id).ok_or(Error::InternalError)?;
+        if space.need_send_ack {
+            return Ok(());
+        }
+
+        // An endpoint MUST acknowledge all ack-eliciting Initial and Handshake
+        // packets immediately
+        if space.id == SpaceId::Initial || space.id == SpaceId::Handshake {
+            space.need_send_ack = true;
+            return Ok(());
+        }
+
+        // A receiver SHOULD send an ACK frame after receiving at least two
+        // ack-eliciting packets.
+        space.ack_eliciting_pkts_since_last_sent_ack += 1;
+        let ack_eliciting_threshold = self.recovery_conf.ack_eliciting_threshold;
+        if space.ack_eliciting_pkts_since_last_sent_ack >= ack_eliciting_threshold {
+            space.need_send_ack = true;
+            space.ack_timer = None;
+            return Ok(());
+        }
+
+        // In order to assist loss detection at the sender, an endpoint SHOULD
+        // generate and send an ACK frame without delay when it receives an
+        // ack-eliciting packet either:
+        // - when the received packet has a packet number less than another
+        //   ack-eliciting packet that has been received, or
+        // - when the packet has a packet number larger than the highest-numbered
+        // ack-eliciting packet that has been received and there are missing
+        // packets between that packet and this packet.
+        if pkt_num < space.largest_rx_ack_eliciting_pkt_num
+            || pkt_num > space.largest_rx_ack_eliciting_pkt_num + 1
+        {
+            space.need_send_ack = true;
+            space.ack_timer = None;
+            return Ok(());
+        }
+
+        // All ack-eliciting 0-RTT and 1-RTT packets within its advertised
+        // max_ack_delay.
+        if space.ack_timer.is_none() {
+            let ack_delay = time::Duration::from_millis(self.peer_transport_params.max_ack_delay);
+            space.ack_timer = Some(time::Instant::now() + ack_delay);
+            debug!(
+                "{} set ack timer for space {:?}, timeout {:?} ",
+                &self.trace_id, space_id, space.ack_timer
+            );
         }
         Ok(())
     }
@@ -1275,14 +1426,26 @@ impl Connection {
                         self.streams
                             .on_stream_frame_acked(stream_id, offset, length);
 
-                        // Write TransportDataMoved event to qlog
+                        // Write QuicStreamDataMoved event to qlog
                         if let Some(qlog) = &mut self.qlog {
-                            Self::qlog_transport_data_acked(qlog, stream_id, offset, length);
+                            Self::qlog_quic_data_acked(qlog, stream_id, offset, length);
                         }
                     }
 
                     Frame::ResetStream { stream_id, .. } => {
                         self.streams.on_reset_stream_frame_acked(stream_id);
+                    }
+
+                    Frame::Ping {
+                        pmtu_probe: Some((path_id, probe_size)),
+                    } => {
+                        if let Ok(path) = self.paths.get_mut(path_id) {
+                            let peer_mds = self.peer_transport_params.max_udp_payload_size as usize;
+                            path.dplpmtud.on_pmtu_probe_acked(probe_size, peer_mds);
+                            let current = path.dplpmtud.get_current_size();
+                            path.recovery.update_max_datagram_size(current, false);
+                            debug!("{} path {:?} MTU is {} now", self.trace_id, path, current);
+                        }
                     }
 
                     _ => (),
@@ -1310,16 +1473,18 @@ impl Connection {
         }
     }
 
-    /// Get the maximum possible size of outgoing QUIC packet.
-    /// This is depended on both the configured max datagram size and the max_udp_payload_size
-    /// transport parameter advertised by the remote peer.
-    pub(crate) fn max_datagram_size(&self) -> usize {
-        if !self.is_established() {
+    /// Get the maximum datagram size of the given path.
+    pub(crate) fn max_datagram_size(&self, pid: usize) -> usize {
+        // The peer's `max_udp_payload_size` transport parameter limits the
+        // size of UDP payloads that it is willing to receive. Therefore,
+        // prior to receiving that parameter, we only use the default value.
+        if !self.flags.contains(AppliedPeerTransportParams) {
             return crate::MIN_CLIENT_INITIAL_LEN;
         }
 
+        // Use the validated max_datagram_size
         self.paths
-            .get_active()
+            .get(pid)
             .ok()
             .map_or(crate::MIN_CLIENT_INITIAL_LEN, |path| {
                 path.recovery.max_datagram_size
@@ -1329,10 +1494,12 @@ impl Connection {
     /// Write coalesced multiple QUIC packets to the given buffer which will
     /// then be sent to the peer.
     ///
+    /// The size of `out` should be at least 1200 bytes, ideally matching or
+    /// exceeding the maximum possible MTU.
+    ///
     /// Return Error::Done if no packet can be sent.
     pub(crate) fn send(&mut self, out: &mut [u8]) -> Result<(usize, PacketInfo)> {
-        if out.is_empty() {
-            // TODO: use more strict condition
+        if out.len() < crate::MIN_CLIENT_INITIAL_LEN {
             return Err(Error::BufferTooShort);
         }
 
@@ -1362,23 +1529,24 @@ impl Connection {
         // Select a path for sending a packet
         let pid = self.select_send_path()?;
 
-        // TODO: limit bytes sent before address validation
-        // TODO: limit bytes sent by path mtu.
-        let mut left = cmp::min(out.len(), self.max_datagram_size());
-        let out = &mut out[..left];
+        // Limit bytes sent by path MTU limit and server send limit before address validation
+        let mut left = cmp::min(out.len(), self.max_datagram_size(pid));
+        left = self.paths.cmp_anti_ampl_limit(pid, left);
+
         let mut done = 0;
 
         // Write QUIC packets to the buffer
         let mut has_initial = false;
         while left > 0 {
-            let (pkt_type, written) = match self.send_packet(&mut out[done..], pid, has_initial) {
-                Ok(v) => v,
-                Err(Error::BufferTooShort) | Err(Error::Done) => break,
-                Err(e) => return Err(e),
-            };
+            let (pkt_type, is_pmtu_probe, written) =
+                match self.send_packet(&mut out[done..], left, pid, done == 0, has_initial) {
+                    Ok(v) => v,
+                    Err(Error::BufferTooShort) | Err(Error::Done) => break,
+                    Err(e) => return Err(e),
+                };
 
-            left -= written;
-            done += written;
+            left = left.saturating_sub(written);
+            done = done.saturating_add(written);
 
             match pkt_type {
                 PacketType::Initial => has_initial = true,
@@ -1388,6 +1556,13 @@ impl Connection {
                 PacketType::OneRTT => break,
 
                 _ => (),
+            }
+
+            // The PMTU probe is not coalesced with other packets, since packets
+            // that are larger than the current maximum datagram size are more
+            // likely to be dropped by the network.
+            if is_pmtu_probe {
+                break;
             }
         }
 
@@ -1410,13 +1585,24 @@ impl Connection {
         let info = PacketInfo {
             src: path.local_addr(),
             dst: path.remote_addr(),
-            time: time::Instant::now(), // TODO: Set an appropriate sending time
+            time: time::Instant::now(),
         };
         Ok((done, info))
     }
 
     /// Write a QUIC packet to the given buffer.
     ///
+    /// The `out` is the write buffer with a size that must be no less than `left`.
+    /// The `left` is the upper limit for the write size when sending a non-PMTU
+    /// probe packet.
+    /// The `path_id` is the selected path for sending out packets.
+    /// The `first` indicates that it is the first packet being written to the UDP
+    /// datagram.
+    /// The `has_initial` indicates that a previous Initial packet has been written
+    /// the UDP datagram.
+    ///
+    /// Return a tuple consisting of the packet type, PMUT probe flag, and the
+    /// packet size upon success.
     /// Return `Error::BufferTooShort` if the input buffer is too small to
     /// write a single QUIC packet.
     /// Return `Error::Done` if no packet can be sent.
@@ -1424,13 +1610,15 @@ impl Connection {
     fn send_packet(
         &mut self,
         out: &mut [u8],
+        mut left: usize,
         path_id: usize,
+        first: bool,
         has_initial: bool,
-    ) -> Result<(PacketType, usize)> {
+    ) -> Result<(PacketType, bool, usize)> {
         let now = time::Instant::now();
 
-        if out.is_empty() {
-            return Err(Error::BufferTooShort);
+        if out.len() < left {
+            return Err(Error::InvalidState("buffer too short".into()));
         }
 
         if self.is_draining() {
@@ -1441,16 +1629,16 @@ impl Connection {
         let pkt_type = self.select_send_packet_type(path_id)?;
         let level = pkt_type.to_level()?;
 
-        let mut left = out.len();
-
         // Prepare and encode packet header (except for the Length and Packet Number field)
         let space_id = self.get_space_id(pkt_type, path_id)?;
-        let pkt_num = self
-            .spaces
-            .get_mut(space_id)
-            .ok_or(Error::InternalError)?
-            .next_pkt_num;
-        let pkt_num_len = packet::packet_num_len(pkt_num)?;
+        let (pkt_num, pkt_num_len) = {
+            let space = self.spaces.get_mut(space_id).ok_or(Error::InternalError)?;
+            let largest_acked = space.get_largest_acked_pkt();
+            let pkt_num = space.next_pkt_num;
+            let pkt_num_len = packet::packet_num_len(pkt_num, largest_acked);
+            (pkt_num, pkt_num_len)
+        };
+
         let dcid_seq = self
             .paths
             .get(path_id)?
@@ -1479,9 +1667,9 @@ impl Connection {
             } else {
                 None
             },
-            key_phase: false,
+            key_phase: self.tls_session.current_key_phase(),
         };
-        let hdr_offset = hdr.to_bytes(out)?;
+        let hdr_offset = hdr.to_bytes(&mut out[..left])?;
 
         // Check the size of remaining space of the buffer
         let mut pkt_num_offset = hdr_offset;
@@ -1505,9 +1693,8 @@ impl Connection {
         }
 
         // Encode packet number
-        let len = packet::encode_packet_num(pkt_num, &mut out[pkt_num_offset..])?;
+        let len = packet::encode_packet_num(pkt_num, pkt_num_len, &mut out[pkt_num_offset..left])?;
         let payload_offset = pkt_num_offset + len;
-        let payload_end = out.len() - crypto_overhead; // Reserved for crypto overhead
 
         // Write frames into the packet payload
         let (ack_elicit_required, is_probe) = {
@@ -1517,14 +1704,17 @@ impl Connection {
         let mut write_status = FrameWriteStatus {
             ack_elicit_required,
             is_probe,
+            overhead: total_overhead,
             ..FrameWriteStatus::default()
         };
 
         match self.send_frames(
-            &mut out[payload_offset..payload_end],
+            &mut out[payload_offset..],
+            left,
             &mut write_status,
             pkt_type,
             path_id,
+            first,
             has_initial,
         ) {
             Ok(..) => (),
@@ -1553,18 +1743,23 @@ impl Connection {
             cid_seq = Some(dcid_seq as u32);
         }
 
-        let written = packet::encrypt_packet(
-            out,
-            cid_seq,
-            pkt_num,
-            pkt_num_len,
-            payload_len,
-            payload_offset,
-            None,
-            key,
-        )?;
+        let written = if !self.is_encryption_disabled(hdr.pkt_type) {
+            packet::encrypt_packet(
+                out,
+                cid_seq,
+                pkt_num,
+                pkt_num_len,
+                payload_len,
+                payload_offset,
+                None,
+                key,
+            )?
+        } else {
+            payload_offset + payload_len
+        };
 
         let sent_pkt = space::SentPacket {
+            pkt_type,
             pkt_num,
             time_sent: now,
             time_acked: None,
@@ -1573,9 +1768,10 @@ impl Connection {
             ack_eliciting: write_status.ack_eliciting,
             in_flight: write_status.in_flight,
             has_data: write_status.has_data,
+            pmtu_probe: write_status.is_pmtu_probe,
             frames: write_status.frames,
             rate_sample_state: Default::default(),
-            reinjected: write_status.reinjected,
+            buffer_flags: write_status.buffer_flags,
         };
         debug!(
             "{} sent packet {:?} {:?} {:?}",
@@ -1585,13 +1781,19 @@ impl Connection {
             self.paths.get(path_id)?
         );
 
-        // Write TransportPacketSent event to qlog.
+        // Write events to qlog.
         if let Some(qlog) = &mut self.qlog {
+            // Write TransportPacketSent event to qlog.
             let mut qframes = Vec::with_capacity(sent_pkt.frames.len());
             for frame in &sent_pkt.frames {
                 qframes.push(frame.to_qlog());
             }
-            Self::qlog_transport_packet_sent(qlog, &hdr, pkt_num, written, payload_len, qframes);
+            Self::qlog_quic_packet_sent(qlog, &hdr, pkt_num, written, payload_len, qframes);
+
+            // Write RecoveryMetricsUpdate event to qlog.
+            if let Ok(path) = self.paths.get_mut(path_id) {
+                path.recovery.qlog_recovery_metrics_updated(qlog);
+            }
         }
 
         // Notify the packet sent event to the multipath scheduler
@@ -1623,17 +1825,30 @@ impl Connection {
             self.paths.on_path_chal_sent(path_id, data, written, now)?;
         }
 
+        if write_status.is_pmtu_probe {
+            self.paths
+                .get_mut(path_id)?
+                .dplpmtud
+                .on_pmtu_probe_sent(written);
+        }
+
         // Update connection state and statistic metrics
         self.stats.sent_count += 1;
         self.stats.sent_bytes += written as u64;
-        self.paths.get_mut(path_id)?.stats.sent_count += 1;
-        self.paths.get_mut(path_id)?.stats.sent_bytes += written as u64;
+        self.paths
+            .get_mut(path_id)?
+            .recovery
+            .stat_sent_event(1, written as u64);
+        self.paths.dec_anti_ampl_limit(path_id, written);
         {
             let space = self.spaces.get_mut(space_id).ok_or(Error::InternalError)?;
             space.next_pkt_num += 1;
             if pkt_type == PacketType::OneRTT {
                 let lowest_1rtt_pkt_num = space.lowest_1rtt_pkt_num;
                 space.lowest_1rtt_pkt_num = cmp::min(lowest_1rtt_pkt_num, pkt_num);
+                if space.first_pkt_num_sent.is_none() {
+                    space.first_pkt_num_sent = Some(pkt_num);
+                }
             }
         }
 
@@ -1658,36 +1873,54 @@ impl Connection {
             self.flags.insert(SentAckElicitingSinceRecvPkt);
         }
 
-        Ok((pkt_type, written))
+        Ok((pkt_type, write_status.is_pmtu_probe, written))
     }
 
-    // Write QUIC frames to the payload of a QUIC packet.
-    //
-    // The current write offset in the `out` buffer is recorded in `st.written`
-    // Return Error::Done if there is no frame to send or no left room to write more frames.
-    // Return other Error if found unexpected error.
+    /// Write QUIC frames to the payload of a QUIC packet.
+    ///
+    /// The current write offset in the `out` buffer is recorded in `st.written`
+    /// Return Error::Done if there is no frame to send or no left room to write more frames.
+    /// Return other Error if found unexpected error.
+    #[allow(clippy::too_many_arguments)]
     fn send_frames(
         &mut self,
-        out: &mut [u8],
+        buf: &mut [u8],
+        left: usize,
         st: &mut FrameWriteStatus,
         pkt_type: PacketType,
         path_id: usize,
+        first: bool,
         has_initial: bool,
     ) -> Result<()> {
-        // Write a ACK frame
-        self.try_write_ack_frame(out, st, pkt_type, path_id)?;
+        // Write an ACK frame
+        self.try_write_ack_frame(&mut buf[..left], st, pkt_type, path_id)?;
 
         // Write a CONNECTION_CLOSE frame
-        self.try_write_close_frame(out, st, pkt_type, path_id)?;
+        self.try_write_close_frame(&mut buf[..left], st, pkt_type, path_id)?;
+
+        let path = self.paths.get_mut(path_id)?;
+        path.recovery.stat_cwnd_limited();
+
+        let now = time::Instant::now();
+        let r = &mut self.paths.get_mut(path_id)?.recovery;
 
         // Check the congestion window
         // - Packets containing frames besides ACK or CONNECTION_CLOSE frames
         // count toward congestion control limits. (RFC 9002 Section 3)
         // - Probe packets are allowed to temporarily exceed the congestion
         // window. (RFC 9002 Section 4.7)
-        if !st.is_probe && !self.paths.get(path_id)?.recovery.can_send() {
+        if !st.is_probe && !r.can_send() {
             return Err(Error::Done);
         }
+
+        // Write PMTU probe frames
+        // Note: To probe the path MTU, the write size will exceed `left` but
+        // not surpass the length of `buf`.
+        self.try_write_pmut_probe_frames(buf, st, pkt_type, path_id, first)?;
+
+        // Since it's not a PMTU probe packet, let's cap the buffer size for
+        // simplicity.
+        let out = &mut buf[..left];
 
         // Write PATH_CHALLENGE/PATH_RESPONSE frames
         self.try_write_path_validation_frames(out, st, pkt_type, path_id)?;
@@ -1714,8 +1947,8 @@ impl Connection {
         // Write a CRYPTO frame
         self.try_write_crypto_frame(out, st, pkt_type, path_id)?;
 
-        // Write reinjected frames
-        self.try_write_reinjected_frames(out, st, pkt_type, path_id)?;
+        // Write buffered frames
+        self.try_write_buffered_frames(out, st, pkt_type, path_id)?;
 
         // Write STREAM frames
         self.try_write_stream_frames(out, st, pkt_type, path_id)?;
@@ -1724,11 +1957,15 @@ impl Connection {
         self.try_write_new_token_frame(out, st, pkt_type, path_id)?;
 
         // Write a PING frame
-        if st.ack_elicit_required && !st.ack_eliciting && !self.is_closing() {
-            let frame = Frame::Ping;
+        if ((st.ack_elicit_required && !st.ack_eliciting)
+            || self.paths.get_mut(path_id)?.need_send_ping)
+            && !self.is_closing()
+        {
+            let frame = Frame::Ping { pmtu_probe: None };
             Connection::write_frame_to_packet(frame, out, st)?;
             st.ack_eliciting = true;
             st.in_flight = true;
+            self.paths.get_mut(path_id)?.need_send_ping = false;
         }
 
         // No frames to be sent
@@ -1738,7 +1975,26 @@ impl Connection {
         }
 
         // Write PADDING frames
-        if (has_initial || !self.paths.get(path_id)?.validated()) && (out.len() - st.written >= 1) {
+        if (out.len() - st.written >= 1)
+            && (
+                // Expand the payload of all UDP datagrams carrying Initial packets to
+                // at least the smallest allowed maximum datagram size. Sending UDP
+                // datagrams of this size ensures that the network path supports a
+                // reasonable Path Maximum Transmission Unit (PMTU), in both directions.
+                has_initial
+                // To prevent deadlock when the server reaches its anti-amplification
+                // limit, clients MUST send a packet on a Probe Timeout (PTO).
+                // Specifically, the client MUST send an Initial packet in a UDP datagram
+                // that contains at least 1200 bytes if it does not have Handshake keys,
+                // and otherwise send a Handshake packet.
+                || (st.is_probe && !self.is_server && pkt_type == PacketType::Handshake)
+                // An endpoint MUST expand datagrams that contain a PATH_CHALLENGE or
+                // PATH_RESPONSE frame to at least the smallest allowed maximum datagram
+                // size. This verifies that the path is able to carry datagrams of this
+                // size in both directions.
+                || self.paths.get(path_id)?.need_expand_padding_frames(self.is_server)
+            )
+        {
             let frame = Frame::Paddings {
                 len: out.len() - st.written,
             };
@@ -1790,6 +2046,55 @@ impl Connection {
         Ok(())
     }
 
+    /// Write PMTU probe frames if needed.
+    fn try_write_pmut_probe_frames(
+        &mut self,
+        buf: &mut [u8],
+        st: &mut FrameWriteStatus,
+        pkt_type: PacketType,
+        path_id: usize,
+        first: bool,
+    ) -> Result<()> {
+        if pkt_type != PacketType::OneRTT
+            || !self.flags.contains(HandshakeCompleted)
+            || self.is_closing()
+            || !first
+            || !st.frames.is_empty()
+        {
+            return Ok(());
+        }
+
+        let peer_mds = self.peer_transport_params.max_udp_payload_size as usize;
+        let path = self.paths.get_mut(path_id)?;
+        let probe_size = path.dplpmtud.get_probe_size(peer_mds);
+        if !path.validated()
+            || !path.dplpmtud.should_probe()
+            || probe_size > buf.len()
+            || (probe_size as u64) > path.recovery.congestion.congestion_window()
+            || path.recovery.congestion.in_recovery(time::Instant::now())
+        {
+            return Ok(());
+        }
+
+        // The content of the PMTU probe is limited to PING and PADDING frames.
+        let frame = frame::Frame::Ping {
+            pmtu_probe: Some((path_id, probe_size)),
+        };
+        Connection::write_frame_to_packet(frame, buf, st)?;
+
+        let padding_len = probe_size - st.overhead - 1;
+        let frame = frame::Frame::Paddings { len: padding_len };
+        Connection::write_frame_to_packet(frame, buf, st)?;
+
+        st.ack_eliciting = true;
+        st.in_flight = true;
+        st.is_pmtu_probe = true;
+
+        // Finish writing the datagram to prevent it from coalescing with other
+        // QUIC packets.
+        Err(Error::Done)
+    }
+
     /// Populate Acknowledgement frame to packet payload buffer.
     fn try_write_ack_frame(
         &mut self,
@@ -1821,6 +2126,7 @@ impl Connection {
         };
         Connection::write_frame_to_packet(frame, out, st)?;
         space.need_send_ack = false;
+        space.ack_eliciting_pkts_since_last_sent_ack = 0;
 
         Ok(())
     }
@@ -1974,9 +2280,7 @@ impl Connection {
         }
 
         // Create MAX_DATA frame if needed.
-        if self.streams.rx_almost_full
-            && self.streams.max_rx_data() < self.streams.max_rx_data_next()
-        {
+        if self.streams.need_send_max_data() {
             // Adjust the connection window size automatically.
             self.streams
                 .autotune_window(now, path.recovery.rtt.smoothed_rtt());
@@ -2211,9 +2515,9 @@ impl Connection {
             // Read stream data and write into the packet buffer directly.
             let (frame_data_len, fin) = stream.send.read(&mut out[len + frame_hdr_len..])?;
 
-            // Retain stream data for reinjection if needed.
+            // Retain stream data if needed.
             let data = if self.flags.contains(EnableMultipath)
-                && reinjection_required(self.multipath_conf.multipath_algor)
+                && buffer_required(self.multipath_conf.multipath_algorithm)
             {
                 let start = len + frame_hdr_len;
                 Bytes::copy_from_slice(&out[start..start + frame_data_len])
@@ -2289,8 +2593,8 @@ impl Connection {
         Ok(())
     }
 
-    /// Populate reinjected frame to packet payload buffer.
-    fn try_write_reinjected_frames(
+    /// Populate buffered frame to packet payload buffer.
+    fn try_write_buffered_frames(
         &mut self,
         out: &mut [u8],
         st: &mut FrameWriteStatus,
@@ -2301,33 +2605,31 @@ impl Connection {
             return Ok(());
         }
 
-        let out = &mut out[st.written..];
         let path = self.paths.get(path_id)?;
         if pkt_type != PacketType::OneRTT
             || self.is_closing()
-            || out.len() <= frame::MAX_STREAM_OVERHEAD
+            || out.len() - st.written <= frame::MAX_STREAM_OVERHEAD
             || !path.active()
         {
             return Ok(());
         }
 
-        // Get reinjected frames on the path.
+        // Get buffered frames on the path.
         let space = self
             .spaces
             .get_mut(path.space_id)
             .ok_or(Error::InternalError)?;
-        let frames = &mut space.reinject.frames;
-        debug!(
-            "{} try to write reinjected frames: path_id={} reinjected_frames={}",
-            self.trace_id,
-            path_id,
-            frames.len()
-        );
-        if frames.is_empty() {
+        if space.buffered.is_empty() {
             return Ok(());
         }
+        debug!(
+            "{} try to write buffered frames: path_id={} frames={}",
+            self.trace_id,
+            path_id,
+            space.buffered.len()
+        );
 
-        while let Some(frame) = frames.pop_front() {
+        while let Some((frame, buffer_type)) = space.buffered.pop_front() {
             match frame {
                 Frame::Stream {
                     stream_id,
@@ -2341,65 +2643,76 @@ impl Connection {
                         _ => continue,
                     };
 
-                    // Check acked range and injected the first non-acked subrange
+                    // Check acked range and write the first non-acked subrange
                     let range = offset..offset + length as u64;
                     if let Some(r) = stream.send.filter_acked(range) {
-                        let data_len = (r.end - r.start) as usize;
-                        let frame_len = Self::reinjected_stream_frame_to_packet(
+                        let data_len = Self::write_buffered_stream_frame_to_packet(
                             stream_id,
                             r.start,
-                            data_len,
-                            fin && data_len == length,
+                            fin && r.end == offset + length as u64,
                             data.slice((r.start - offset) as usize..(r.end - offset) as usize),
                             out,
+                            buffer_type,
                             st,
                         )?;
 
                         // Processing the following subrange.
-                        if r.end < offset + length as u64 {
+                        if r.start + (data_len as u64) < offset + length as u64 {
+                            let tail_len =
+                                (offset + length as u64 - r.start - data_len as u64) as usize;
                             let frame = Frame::Stream {
                                 stream_id,
-                                offset: r.end,
-                                length: length - (r.end - offset) as usize,
+                                offset: r.start + data_len as u64,
+                                length: tail_len,
                                 fin,
-                                data: data.slice((r.end - offset) as usize..),
+                                data: data.slice(length - tail_len..),
                             };
-                            frames.push_front(frame);
+                            space.buffered.push_front(frame, buffer_type);
+                        }
+
+                        if data_len == 0 {
+                            break;
                         }
                     }
                 }
 
-                // Ignore other reinjected frames.
+                // Ignore other buffered frames.
                 _ => continue,
-            }
-
-            let out = &mut out[st.written..];
-            if out.len() <= frame::MAX_STREAM_OVERHEAD {
-                break;
             }
         }
 
         Ok(())
     }
 
-    fn reinjected_stream_frame_to_packet(
+    fn write_buffered_stream_frame_to_packet(
         stream_id: u64,
         offset: u64,
-        length: usize,
-        fin: bool,
-        data: Bytes,
+        mut fin: bool,
+        mut data: Bytes,
         out: &mut [u8],
+        buffer_type: BufferType,
         st: &mut FrameWriteStatus,
     ) -> Result<usize> {
-        let len = frame::encode_stream_header(stream_id, offset, length as u64, fin, out)?;
-        out[len..len + data.len()].copy_from_slice(&data);
+        let out = &mut out[st.written..];
+        if out.len() <= frame::MAX_STREAM_OVERHEAD {
+            return Ok(0);
+        }
 
-        let frame_len = len + data.len();
-        st.written += frame_len;
+        let hdr_len = frame::stream_header_wire_len(stream_id, offset);
+        let data_len = cmp::min(data.len(), out.len() - hdr_len);
+        if data_len < data.len() {
+            data.truncate(data_len);
+            fin = false;
+        }
+
+        frame::encode_stream_header(stream_id, offset, data_len as u64, fin, out)?;
+        out[hdr_len..hdr_len + data.len()].copy_from_slice(&data);
+
+        st.written += hdr_len + data_len;
         st.ack_eliciting = true;
         st.in_flight = true;
         st.has_data = true;
-        st.reinjected = true;
+        st.buffer_flags.mark(buffer_type);
         st.frames.push(Frame::Stream {
             stream_id,
             offset,
@@ -2407,7 +2720,7 @@ impl Connection {
             fin,
             data,
         });
-        Ok(frame_len)
+        Ok(data_len)
     }
 
     /// Populate a QUIC frame to the give buffer.
@@ -2567,24 +2880,40 @@ impl Connection {
                         self.streams.on_max_streams_frame_lost(bidi, max);
                     }
 
+                    // A PING frame contain no information, so lost PING frames
+                    // do not require repair. However, if it indicates the loss
+                    // of a PMTU probe, we will try to schedule a new probe.
+                    Frame::Ping {
+                        pmtu_probe: Some((path_id, probe_size)),
+                    } => {
+                        if let Ok(path) = self.paths.get_mut(path_id) {
+                            let peer_mds = self.peer_transport_params.max_udp_payload_size as usize;
+                            path.dplpmtud.on_pmtu_probe_lost(probe_size, peer_mds);
+                            debug!(
+                                "{} lost MTU probe on path {:?} size={}",
+                                self.trace_id, path, probe_size
+                            );
+                        }
+                    }
+
                     _ => (),
                 }
             }
         }
     }
 
-    /// Select a available path for sending packet
+    /// Select an available path for sending packet
     ///
     /// The selected path should have a packet that can be sent out, unless none
     /// of the paths are feasible.
     fn select_send_path(&mut self) -> Result<usize> {
-        // Select a unvalidated path with path probing packets to send
+        // Select an unvalidated path with path probing packets to send
         if self.is_established() {
             let mut probing = self
                 .paths
                 .iter_mut()
                 .filter(|(_, p)| p.dcid_seq.is_some())
-                .filter(|(_, p)| p.need_send_validation_frames())
+                .filter(|(_, p)| p.need_send_validation_frames(self.is_server))
                 .map(|(pid, _)| pid);
 
             if let Some(pid) = probing.next() {
@@ -2606,7 +2935,7 @@ impl Connection {
                 }
             }
 
-            // Select a validated path with ACK/PTO/Reinjected packets to send.
+            // Select a validated path with ACK/PTO/Buffered packets to send.
             for (pid, path) in self.paths.iter_mut() {
                 if !path.active() {
                     continue;
@@ -2619,7 +2948,10 @@ impl Connection {
                         if space.loss_probes > 0 {
                             return Ok(pid);
                         }
-                        if space.need_send_reinjected_frames() && path.recovery.can_send() {
+                        if space.need_send_buffered_frames() && path.recovery.can_send() {
+                            return Ok(pid);
+                        }
+                        if path.need_send_ping {
                             return Ok(pid);
                         }
                         continue;
@@ -2708,14 +3040,22 @@ impl Connection {
         // If there are sendable, reset, stopped, almost full, blocked streams,
         // or need to update concurrency limits, use the 0RTT/1RTT packet.
         let path = self.paths.get(pid)?;
-        if (self.is_established() || self.tls_session.is_in_early_data())
+        if (self.is_established()
+            // Note: The server's use of 1-RTT keys before the handshake is
+            // complete is limited to sending data. BoringSSL will provide 1-RTT
+            // write secret until the handshake is complete.
+            // See RFC 9001 Section 5.7
+            || self.tls_session.get_keys(Level::OneRTT).seal.is_some()
+            || self.tls_session.is_in_early_data())
             && (self.need_send_handshake_done_frame()
                 || self.need_send_new_token_frame()
                 || self.local_error.as_ref().map_or(false, |e| e.is_app)
-                || path.need_send_validation_frames()
+                || path.need_send_validation_frames(self.is_server)
+                || path.dplpmtud.should_probe()
+                || path.need_send_ping
                 || self.cids.need_send_cid_control_frames()
                 || self.streams.need_send_stream_frames()
-                || self.spaces.need_send_reinjected_frames())
+                || self.spaces.need_send_buffered_frames())
         {
             if !self.is_server && self.tls_session.is_in_early_data() {
                 return Ok(PacketType::ZeroRTT);
@@ -2786,7 +3126,10 @@ impl Connection {
             &self.recovery_conf,
             &self.trace_id,
         );
-        path.max_send_bytes = buf_len * crate::ANTI_AMPLIFICATION_FACTOR;
+        if self.is_server {
+            path.anti_ampl_limit = buf_len * self.paths.anti_ampl_factor;
+        }
+
         path.scid_seq = Some(cid_seq);
         path.initiate_path_chal();
 
@@ -2832,9 +3175,17 @@ impl Connection {
                 Some(time) => self.timers.set(Timer::LossDetection, time),
                 None => self.timers.stop(Timer::LossDetection),
             }
+            match self.paths.min_pacer_timer() {
+                Some(time) => self.timers.set(Timer::Pacer, time),
+                None => self.timers.stop(Timer::Pacer),
+            }
             match self.paths.min_path_chal_timer() {
                 Some(time) => self.timers.set(Timer::PathChallenge, time),
                 None => self.timers.stop(Timer::PathChallenge),
+            }
+            match self.spaces.min_ack_timer() {
+                Some(time) => self.timers.set(Timer::Ack, time),
+                None => self.timers.stop(Timer::Ack),
             }
 
             self.timers.next_timeout()
@@ -2870,14 +3221,47 @@ impl Connection {
                             if timer > now {
                                 continue;
                             }
-                            path.recovery.on_loss_detection_timeout(
-                                SpaceId::Data, // TODO: update for multipath
+                            let (lost_pkts, lost_bytes) = path.recovery.on_loss_detection_timeout(
+                                path.space_id,
                                 &mut self.spaces,
                                 handshake_status,
+                                self.qlog.as_mut(),
                                 now,
                             );
+                            self.stats.lost_count += lost_pkts;
+                            self.stats.lost_bytes += lost_bytes;
+
+                            // Write RecoveryMetricsUpdate event to qlog.
+                            if let Some(qlog) = &mut self.qlog {
+                                path.recovery.qlog_recovery_metrics_updated(qlog);
+                            }
                         }
                     }
+                }
+
+                Timer::Ack => {
+                    for (_, space) in self.spaces.iter_mut() {
+                        if let Some(timer) = space.ack_timer {
+                            if timer > now {
+                                continue;
+                            }
+                            debug!("{} ack timeout for space {:?}", self.trace_id, space.id);
+                            space.need_send_ack = true;
+                            space.ack_timer = None;
+                        }
+                    }
+                }
+
+                Timer::Pacer => {
+                    for (_, path) in self.paths.iter_mut() {
+                        if let Some(timer) = path.recovery.pacer_timer {
+                            if timer > now {
+                                continue;
+                            }
+                        }
+                        path.recovery.pacer_timer = None;
+                    }
+                    self.mark_tickable(true);
                 }
 
                 Timer::Idle => {
@@ -2888,9 +3272,9 @@ impl Connection {
 
                 Timer::Draining => self.flags.insert(Closed),
 
-                Timer::KeyDiscard => (), // TODO: support key discarding
+                Timer::KeyDiscard => self.tls_session.discard_prev_key(),
 
-                Timer::KeepAlive => (), // TODO: schedule a outgoing Ping
+                Timer::KeepAlive => (), // TODO: schedule an outgoing Ping
 
                 Timer::PathChallenge => self.paths.on_path_chal_timeout(now),
 
@@ -2931,12 +3315,17 @@ impl Connection {
         // current Probe Timeout (PTO).
         // See RFC 9000 Section 10.1
         let path_pto = match self.paths.get_active_mut() {
-            Ok(p) => p.recovery.rtt.pto_base(), // TODO: revisit
+            Ok(p) => p.recovery.rtt.pto_base(),
             Err(_) => time::Duration::ZERO,
         };
         let idle_timeout = cmp::max(idle_timeout, 3 * path_pto);
 
         Some(idle_timeout)
+    }
+
+    /// Whether encryption on the specified packet type should be disabled
+    fn is_encryption_disabled(&self, pkt_type: PacketType) -> bool {
+        pkt_type == PacketType::OneRTT && self.flags.contains(DisableEncryption)
     }
 
     /// Check whether the connection is a server connection.
@@ -2983,6 +3372,11 @@ impl Connection {
     /// Return the session data used by resumption.
     pub fn session(&self) -> Option<&[u8]> {
         self.tls_session.session()
+    }
+
+    /// Return details why 0-RTT was accepted or rejected.
+    pub fn early_data_reason(&self) -> Result<Option<&str>> {
+        self.tls_session.early_data_reason()
     }
 
     /// Check whether the connection is draining.
@@ -3256,6 +3650,14 @@ impl Connection {
         })
     }
 
+    /// Send a Ping frame for keep-alive.
+    ///
+    /// If `path_addr` is `None`, a Ping frame will be sent on each active path.
+    /// Otherwise, a Ping frame will be on the specified path.
+    pub fn ping(&mut self, path_addr: Option<FourTuple>) -> Result<()> {
+        self.paths.mark_ping(path_addr)
+    }
+
     /// Client add a new path on the connection.
     pub fn add_path(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<u64> {
         if self.is_server {
@@ -3342,6 +3744,19 @@ impl Connection {
         self.paths.get_active()
     }
 
+    /// Return an mutable reference to the specified path
+    pub fn get_path_stats(
+        &mut self,
+        local_addr: SocketAddr,
+        remote_addr: SocketAddr,
+    ) -> Result<&crate::PathStats> {
+        let pid = self
+            .paths
+            .get_path_id(&(local_addr, remote_addr))
+            .ok_or(Error::InvalidOperation("not found".into()))?;
+        Ok(self.paths.get_mut(pid)?.stats())
+    }
+
     /// Migrates the connection to the specified path.
     #[doc(hidden)]
     pub fn migrate_path(&mut self, local_addr: SocketAddr, remote_addr: SocketAddr) -> Result<()> {
@@ -3365,7 +3780,7 @@ impl Connection {
         }
     }
 
-    /// Return an iterator over streams that have data to read.
+    /// Return an iterator over streams that have data to read or an error to collect.
     pub fn stream_readable_iter(&self) -> StreamIter {
         self.streams.readable_iter()
     }
@@ -3393,11 +3808,13 @@ impl Connection {
 
     /// Set want write flag for a stream.
     pub fn stream_want_write(&mut self, stream_id: u64, want: bool) -> Result<()> {
+        self.mark_tickable(true);
         self.streams.want_write(stream_id, want)
     }
 
     /// Set want read flag for a stream.
     pub fn stream_want_read(&mut self, stream_id: u64, want: bool) -> Result<()> {
+        self.mark_tickable(true);
         self.streams.want_read(stream_id, want)
     }
 
@@ -3408,7 +3825,7 @@ impl Connection {
 
         match self.streams.stream_read(stream_id, out) {
             Ok((read, fin)) => {
-                // Write TransportDataMoved event to qlog
+                // Write QuicStreamDataMoved event to qlog
                 if let Some(qlog) = &mut self.qlog {
                     Self::qlog_transport_data_read(qlog, stream_id, read_off.unwrap_or(0), read);
                 }
@@ -3426,7 +3843,7 @@ impl Connection {
 
         match self.streams.stream_write(stream_id, buf, fin) {
             Ok(written) => {
-                // Write TransportDataMoved event to qlog
+                // Write QuicStreamDataMoved event to qlog
                 if let Some(qlog) = &mut self.qlog {
                     Self::qlog_transport_data_write(
                         qlog,
@@ -3442,8 +3859,25 @@ impl Connection {
     }
 
     /// Create a new stream with given stream id and priority.
+    /// This is a low-level API for stream creation. It is recommended to use
+    /// `stream_bidi_new` for bidirectional streams or `stream_uni_new` for
+    /// unidrectional streams.
     pub fn stream_new(&mut self, stream_id: u64, urgency: u8, incremental: bool) -> Result<()> {
         self.stream_set_priority(stream_id, urgency, incremental)
+    }
+
+    /// Create a new bidirectional stream with given stream priority.
+    /// Return id of the created stream upon success.
+    pub fn stream_bidi_new(&mut self, urgency: u8, incremental: bool) -> Result<u64> {
+        self.mark_tickable(true);
+        self.streams.stream_bidi_new(urgency, incremental)
+    }
+
+    /// Create a new unidrectional stream with given stream priority.
+    /// Return id of the created stream upon success.
+    pub fn stream_uni_new(&mut self, urgency: u8, incremental: bool) -> Result<u64> {
+        self.mark_tickable(true);
+        self.streams.stream_uni_new(urgency, incremental)
     }
 
     /// Shutdown stream reading or writing.
@@ -3474,7 +3908,7 @@ impl Connection {
         self.streams.stream_writable(stream_id, len)
     }
 
-    /// Return true if the stream has data that can be read.
+    /// Return true if the stream has data to be read or an error to be collected.
     pub fn stream_readable(&self, stream_id: u64) -> bool {
         self.streams.stream_readable(stream_id)
     }
@@ -3542,7 +3976,7 @@ impl Connection {
         }
     }
 
-    /// Return a endpoint-facing event.
+    /// Return an endpoint-facing event.
     pub(crate) fn poll(&mut self) -> Option<Event> {
         if let Some(event) = self.events.poll() {
             return Some(event);
@@ -3631,19 +4065,19 @@ impl Connection {
         self.context = Some(Box::new(data))
     }
 
-    /// Write an TransportParametersSet event to the qlog.
-    fn qlog_transport_params_set(
+    /// Write a QuicParametersSet event to the qlog.
+    fn qlog_quic_params_set(
         qlog: &mut qlog::QlogWriter,
         params: &TransportParams,
-        owner: events::TransportOwner,
+        owner: events::Owner,
         cipher: Option<tls::Algorithm>,
     ) {
         let ev_data = params.to_qlog(owner, cipher);
         qlog.add_event_data(time::Instant::now(), ev_data).ok();
     }
 
-    /// Write an TransportPacketReceived event to the qlog.
-    fn qlog_transport_packet_received(
+    /// Write a QuicPacketReceived event to the qlog.
+    fn qlog_quic_packet_received(
         qlog: &mut qlog::QlogWriter,
         hdr: &PacketHeader,
         pkt_num: u64,
@@ -3663,9 +4097,9 @@ impl Connection {
             payload_length: Some(payload_len as u64),
             data: None,
         };
-        let ev_data = events::EventData::TransportPacketReceived {
+        let ev_data = events::EventData::QuicPacketReceived {
             header: qlog_pkt_hdr,
-            frames: Some(qlog_frames),
+            frames: Some(qlog_frames.into()),
             is_coalesced: None,
             retry_token: None,
             stateless_reset_token: None,
@@ -3677,8 +4111,8 @@ impl Connection {
         qlog.add_event_data(time::Instant::now(), ev_data).ok();
     }
 
-    /// Write an TransportPacketSent event to the qlog.
-    fn qlog_transport_packet_sent(
+    /// Write a QuicPacketSent event to the qlog.
+    fn qlog_quic_packet_sent(
         qlog: &mut qlog::QlogWriter,
         hdr: &PacketHeader,
         pkt_num: u64,
@@ -3700,7 +4134,7 @@ impl Connection {
         };
         let now = time::Instant::now();
 
-        let ev_data = events::EventData::TransportPacketSent {
+        let ev_data = events::EventData::QuicPacketSent {
             header: qlog_pkt_hdr,
             frames: Some(qlog_frames.into()),
             is_coalesced: None,
@@ -3709,20 +4143,20 @@ impl Connection {
             supported_versions: None,
             raw: Some(qlog_raw_info),
             datagram_id: None,
-            send_at_time: Some(qlog.relative_time(now)),
+            is_mtu_probe_packet: None,
             trigger: None,
         };
         qlog.add_event_data(now, ev_data).ok();
     }
 
-    /// Write an TransportDataMoved event to the qlog.
-    fn qlog_transport_data_acked(
+    /// Write a QuicStreamDataMoved event to the qlog.
+    fn qlog_quic_data_acked(
         qlog: &mut qlog::QlogWriter,
         stream_id: u64,
         offset: u64,
         length: usize,
     ) {
-        let ev_data = events::EventData::TransportDataMoved {
+        let ev_data = events::EventData::QuicStreamDataMoved {
             stream_id: Some(stream_id),
             offset: Some(offset),
             length: Some(length as u64),
@@ -3733,14 +4167,14 @@ impl Connection {
         qlog.add_event_data(time::Instant::now(), ev_data).ok();
     }
 
-    /// Write an TransportDataMoved event to the qlog.
+    /// Write a QuicStreamDataMoved event to the qlog.
     fn qlog_transport_data_read(
         qlog: &mut qlog::QlogWriter,
         stream_id: u64,
         read_off: u64,
         read: usize,
     ) {
-        let ev_data = qlog::events::EventData::TransportDataMoved {
+        let ev_data = qlog::events::EventData::QuicStreamDataMoved {
             stream_id: Some(stream_id),
             offset: Some(read_off),
             length: Some(read as u64),
@@ -3751,14 +4185,14 @@ impl Connection {
         qlog.add_event_data(time::Instant::now(), ev_data).ok();
     }
 
-    /// Write TransportDataMoved event to the qlog.
+    /// Write a QuicStreamDataMoved event to the qlog.
     fn qlog_transport_data_write(
         qlog: &mut qlog::QlogWriter,
         stream_id: u64,
         write_off: u64,
         written: usize,
     ) {
-        let ev_data = qlog::events::EventData::TransportDataMoved {
+        let ev_data = qlog::events::EventData::QuicStreamDataMoved {
             stream_id: Some(stream_id),
             offset: Some(write_off),
             length: Some(written as u64),
@@ -3816,13 +4250,80 @@ impl CryptoStreams {
     /// stream data. QUIC relies on the implementation to avoid excessive
     /// buffering of data
     fn new_stream() -> Stream {
-        Stream::new(
-            true,
-            true,
-            std::u64::MAX,
-            std::u64::MAX,
-            stream::MAX_STREAM_WINDOW,
-        )
+        Stream::new(true, true, u64::MAX, u64::MAX, stream::MAX_STREAM_WINDOW)
+    }
+}
+
+/// Collection of packets which were received before decryption keys are available.
+struct UndecryptablePackets {
+    zerortt_pkts: VecDeque<(Vec<u8>, PacketInfo)>,
+    handshake_pkts: VecDeque<(Vec<u8>, PacketInfo)>,
+    onertt_pkts: VecDeque<(Vec<u8>, PacketInfo)>,
+    capacity: usize,
+}
+
+impl UndecryptablePackets {
+    fn new(capacity: usize) -> Self {
+        Self {
+            zerortt_pkts: VecDeque::with_capacity(capacity),
+            handshake_pkts: VecDeque::with_capacity(capacity),
+            onertt_pkts: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn push(&mut self, pkt_type: &PacketType, pkt: Vec<u8>, info: &PacketInfo) -> bool {
+        match pkt_type {
+            PacketType::ZeroRTT => {
+                if self.zerortt_pkts.len() > self.capacity {
+                    false
+                } else {
+                    self.zerortt_pkts.push_back((pkt, *info));
+                    true
+                }
+            }
+            PacketType::Handshake => {
+                if self.handshake_pkts.len() > self.capacity {
+                    false
+                } else {
+                    self.handshake_pkts.push_back((pkt, *info));
+                    true
+                }
+            }
+            PacketType::OneRTT => {
+                if self.onertt_pkts.len() > self.capacity {
+                    false
+                } else {
+                    self.onertt_pkts.push_back((pkt, *info));
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn pop(&mut self, pkt_type: &PacketType) -> Option<(Vec<u8>, PacketInfo)> {
+        match pkt_type {
+            PacketType::ZeroRTT => self.zerortt_pkts.pop_front(),
+            PacketType::Handshake => self.handshake_pkts.pop_front(),
+            PacketType::OneRTT => self.onertt_pkts.pop_front(),
+            _ => None,
+        }
+    }
+
+    fn is_empty(&self, pkt_type: &PacketType) -> bool {
+        match pkt_type {
+            PacketType::ZeroRTT => self.zerortt_pkts.is_empty(),
+            PacketType::Handshake => self.handshake_pkts.is_empty(),
+            PacketType::OneRTT => self.onertt_pkts.is_empty(),
+            _ => true,
+        }
+    }
+
+    fn all_empty(&self) -> bool {
+        self.zerortt_pkts.is_empty()
+            && self.handshake_pkts.is_empty()
+            && self.onertt_pkts.is_empty()
     }
 }
 
@@ -3894,25 +4395,29 @@ enum ConnectionFlags {
 
     /// The multipath extension is successfully negotiated.
     EnableMultipath = 1 << 20,
+
+    /// The disable_1rtt_encryption is successfully negotiated.
+    DisableEncryption = 1 << 21,
 }
 
 /// Statistics about a QUIC connection.
+#[repr(C)]
 #[derive(Default)]
 pub struct ConnectionStats {
     /// Total number of received packets.
-    pub recv_count: usize,
-
-    /// Total number of sent packets.
-    pub sent_count: usize,
-
-    /// Total number of lost packets.
-    pub lost_count: usize,
+    pub recv_count: u64,
 
     /// Total number of bytes received on the connection.
     pub recv_bytes: u64,
 
+    /// Total number of sent packets.
+    pub sent_count: u64,
+
     /// Total number of bytes sent on the connection.
     pub sent_bytes: u64,
+
+    /// Total number of lost packets.
+    pub lost_count: u64,
 
     /// Total number of bytes lost on the connection.
     pub lost_bytes: u64,
@@ -3931,7 +4436,7 @@ struct FrameWriteStatus {
     /// Whether it contains frames other than ACK, PADDING, and CONNECTION_CLOSE
     ack_eliciting: bool,
 
-    /// Whether it is a in-flight packet (ack-eliciting packet or contain a
+    /// Whether it is an in-flight packet (ack-eliciting packet or contain a
     /// PADDING frame)
     in_flight: bool,
 
@@ -3947,8 +4452,14 @@ struct FrameWriteStatus {
     /// Whether the congestion window should be ignored.
     is_probe: bool,
 
-    /// Whether it is a reinjected packet.
-    reinjected: bool,
+    /// Whether it is a PMTU probe packet
+    is_pmtu_probe: bool,
+
+    /// Packet overhead (i.e. packet header and crypto overhead) in bytes
+    overhead: usize,
+
+    /// Status about buffered frames written to the packet.
+    buffer_flags: BufferFlags,
 }
 
 /// Handshake status for loss recovery
@@ -3970,6 +4481,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::multipath_scheduler::MultipathAlgorithm;
     use crate::packet;
+    use crate::ranges::RangeSet;
     use crate::tls::tests::ServerConfigSelector;
     use crate::tls::TlsConfig;
     use crate::tls::TlsConfigSelector;
@@ -4006,8 +4518,8 @@ pub(crate) mod tests {
             server_config: &mut Config,
             server_name: &str,
         ) -> Result<TestPair> {
-            let mut cli_cid_gen = RandomConnectionIdGenerator::new(client_config.cid_len, None);
-            let mut srv_cid_gen = RandomConnectionIdGenerator::new(server_config.cid_len, None);
+            let mut cli_cid_gen = RandomConnectionIdGenerator::new(client_config.cid_len);
+            let mut srv_cid_gen = RandomConnectionIdGenerator::new(server_config.cid_len);
             let client_scid = cli_cid_gen.generate();
             let server_scid = srv_cid_gen.generate();
             let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443);
@@ -4098,7 +4610,7 @@ pub(crate) mod tests {
         pub fn conn_packets_out(conn: &mut Connection) -> Result<Vec<(Vec<u8>, PacketInfo)>> {
             let mut packets = Vec::new();
             loop {
-                let mut out = vec![0u8; 1350];
+                let mut out = vec![0u8; 1500];
                 let info = match conn.send(&mut out) {
                     Ok((written, info)) => {
                         out.truncate(written);
@@ -4260,6 +4772,8 @@ pub(crate) mod tests {
             conf.set_send_batch_size(2);
             conf.set_max_handshake_timeout(0);
             conf.enable_multipath(false);
+            conf.enable_dplpmtud(true);
+            conf.enable_pacing(false);
 
             let application_protos = vec![b"h3".to_vec()];
             let tls_config = if !is_server {
@@ -4300,6 +4814,30 @@ pub(crate) mod tests {
                 fin: false,
                 data: Bytes::copy_from_slice(content),
             }
+        }
+
+        /// Assemble new version negotiation packet.
+        fn new_test_version_negotiation_packet(
+            dcid: &ConnectionId,
+            scid: &ConnectionId,
+            versions: &[u8],
+        ) -> Vec<u8> {
+            let mut pkt = vec![
+                0x80, // Header form and unused bits.
+                0x00, 0x00, 0x00, 0x00, // The Version field must be set to 0x00000000.
+            ];
+
+            // Append DCID.
+            pkt.push(dcid.len);
+            pkt.append(&mut dcid.data.to_vec());
+            // Append SCID.
+            pkt.push(scid.len);
+            pkt.append(&mut scid.data.to_vec());
+            // Append supported versions.
+            let mut versions = versions.to_vec();
+            pkt.append(&mut versions);
+
+            pkt
         }
 
         /// Create random test data
@@ -4349,6 +4887,117 @@ pub(crate) mod tests {
             TestPair::conn_packets_in(&mut self.server, packets)?;
             Ok(())
         }
+    }
+
+    #[test]
+    fn version_negotiation_with_unknown_version() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.scid().as_ref().unwrap(),
+            test_pair.client.dcid().as_ref().unwrap(),
+            &vec![0x00, 0x00, 0x00, 0x00],
+        );
+
+        assert_eq!(
+            test_pair.client.recv(&mut pkt, &info),
+            Err(Error::UnknownVersion)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn version_negotiation_with_same_version() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.scid().as_ref().unwrap(),
+            test_pair.client.dcid().as_ref().unwrap(),
+            &vec![0x00, 0x00, 0x00, 0x01],
+        );
+
+        assert!(test_pair.client.recv(&mut pkt, &info).is_ok());
+        assert!(!test_pair.client.flags.contains(DidVersionNegotiation));
+
+        Ok(())
+    }
+
+    #[test]
+    fn version_negotiation_with_invalid_dcid() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.dcid().as_ref().unwrap(),
+            test_pair.client.dcid().as_ref().unwrap(),
+            &vec![0x00, 0x00, 0x00, 0x00],
+        );
+
+        assert!(test_pair.client.recv(&mut pkt, &info).is_ok());
+        assert!(!test_pair.client.flags.contains(DidVersionNegotiation));
+
+        Ok(())
+    }
+
+    #[test]
+    fn version_negotiation_with_invalid_scid() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Assemble version negotiation packet.
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.scid().as_ref().unwrap(),
+            test_pair.client.scid().as_ref().unwrap(),
+            &vec![0x00, 0x00, 0x00, 0x00],
+        );
+
+        assert!(test_pair.client.recv(&mut pkt, &info).is_ok());
+        assert!(!test_pair.client.flags.contains(DidVersionNegotiation));
+
+        Ok(())
+    }
+
+    #[test]
+    fn version_negotiation_with_invalid_version() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.scid().as_ref().unwrap(),
+            test_pair.client.dcid().as_ref().unwrap(),
+            &vec![0xFF],
+        );
+
+        assert!(test_pair.client.recv(&mut pkt, &info).is_ok());
+        assert!(!test_pair.client.flags.contains(DidVersionNegotiation));
+
+        Ok(())
+    }
+
+    #[test]
+    fn version_negotiation_after_other_packet() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(true);
+        assert_eq!(test_pair.handshake(), Ok(()));
+
+        let mut pkt = TestPair::new_test_version_negotiation_packet(
+            test_pair.client.scid().as_ref().unwrap(),
+            test_pair.client.dcid().as_ref().unwrap(),
+            &vec![0x00, 0x00, 0x00, 0x00],
+        );
+
+        assert!(test_pair.client.recv(&mut pkt, &info).is_ok());
+        assert!(!test_pair.client.flags.contains(DidVersionNegotiation));
+
+        Ok(())
     }
 
     #[test]
@@ -4458,22 +5107,22 @@ pub(crate) mod tests {
         assert!(packets.len() > 0);
 
         // Inject a Version Negotiation packet to client
-        let (initial_pkt, info) = packets.pop().unwrap();
+        let (initial_pkt, initial_info) = packets.pop().unwrap();
         let hdr = PacketHeader::from_bytes(&initial_pkt, 20)?.0;
         let mut buf = vec![0; 256];
         let len = packet::version_negotiation(&hdr.dcid, &hdr.scid, &mut buf)?;
         buf.truncate(len);
         let info = PacketInfo {
-            src: info.dst,
-            dst: info.src,
-            time: info.time,
+            src: initial_info.dst,
+            dst: initial_info.src,
+            time: initial_info.time,
         };
 
         // Client drop the Version Negotiation packet with the same version.
         TestPair::conn_packets_in(&mut test_pair.client, vec![(buf, info)])?;
 
         // Client/Server continue the handshake
-        TestPair::conn_packets_in(&mut test_pair.server, vec![(initial_pkt, info)])?;
+        TestPair::conn_packets_in(&mut test_pair.server, vec![(initial_pkt, initial_info)])?;
         assert_eq!(test_pair.handshake(), Ok(()));
         assert_eq!(test_pair.client.is_established(), true);
         assert_eq!(test_pair.server.is_established(), true);
@@ -4600,7 +5249,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handshake_with_0rtt_reordered() -> Result<()> {
+    fn handshake_with_0rtt_reordered_server_side() -> Result<()> {
         let mut client_config = TestPair::new_test_config(false)?;
         let mut server_config = TestPair::new_test_config(true)?;
 
@@ -4617,25 +5266,34 @@ pub(crate) mod tests {
         assert!(test_pair.client.is_in_early_data());
         assert!(!packets.is_empty());
 
-        // Client send ZeorRTT packet
+        // Client send ZeroRTT packet
         let content = "client zero rtt data before initial";
+        let mut frames = vec![];
         let frame = TestPair::new_test_stream_frame(content.as_bytes());
+        frames.push(frame);
         let packet =
-            TestPair::conn_build_packet(&mut test_pair.client, PacketType::ZeroRTT, &[frame])?;
+            TestPair::conn_build_packet(&mut test_pair.client, PacketType::ZeroRTT, &frames)?;
         let info = packets.first().unwrap().1;
 
         // Server recv ZeroRTT packet before Initial packet
         TestPair::conn_packets_in(&mut test_pair.server, vec![(packet, info)])?;
-        assert_eq!(test_pair.client.is_in_early_data(), true);
-        assert_eq!(test_pair.server.streams.has_readable_streams(), false);
-        assert_eq!(test_pair.server.undecryptable_pkts.is_empty(), false);
+        assert!(test_pair.client.is_in_early_data());
+        assert!(!test_pair.server.streams.has_readable_streams());
+        assert!(!test_pair
+            .server
+            .undecryptable_packets
+            .zerortt_pkts
+            .is_empty());
 
         // Server recv the reordered Initial packet
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
         assert_eq!(test_pair.client.is_in_early_data(), true);
-        assert_eq!(test_pair.server.streams.has_readable_streams(), true);
-        assert_eq!(test_pair.server.undecryptable_pkts.is_empty(), true);
-
+        assert!(test_pair
+            .server
+            .undecryptable_packets
+            .zerortt_pkts
+            .is_empty());
+        assert!(test_pair.server.streams.has_readable_streams());
         let stream = test_pair.server.streams.get_mut(0).unwrap();
         let mut buf = vec![0; 128];
         assert_eq!(stream.recv.read(&mut buf)?, (content.len(), false));
@@ -4645,7 +5303,60 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn handshake_with_initial_reordered() -> Result<()> {
+    fn handshake_with_1rtt_reordered_server_side() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+
+        // Client send and server recv Initial.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        // Server send and client recv Initial and Handshake.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(test_pair.client.is_established());
+
+        // Client send OneRTT packet.
+        let content = "client one rtt data before handshake";
+        let mut frames = vec![];
+        let frame = TestPair::new_test_stream_frame(content.as_bytes());
+        frames.push(frame);
+        let packet =
+            TestPair::conn_build_packet(&mut test_pair.client, PacketType::OneRTT, &frames)?;
+
+        // Client send Handshake packets.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        let info = packets.first().unwrap().1;
+
+        // Server recv OneRTT packet before Handshake packets.
+        TestPair::conn_packets_in(&mut test_pair.server, vec![(packet, info)])?;
+        assert!(!test_pair.server.is_confirmed());
+        assert!(!test_pair
+            .server
+            .undecryptable_packets
+            .onertt_pkts
+            .is_empty());
+
+        // Server recv the reordered Handshake packets.
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        assert!(test_pair.server.is_confirmed());
+        assert!(test_pair
+            .server
+            .tls_session
+            .get_keys(Level::OneRTT)
+            .open
+            .is_some());
+        assert!(test_pair.server.streams.has_readable_streams());
+        let stream = test_pair.server.streams.get_mut(0).unwrap();
+        assert!(stream.is_readable());
+        let mut buf = vec![0; 128];
+        assert_eq!(stream.recv.read(&mut buf)?, (content.len(), false));
+        assert_eq!(content.as_bytes(), &buf[..content.len()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_with_handshake_reordered_client_side() -> Result<()> {
         let mut test_pair = TestPair::new_with_test_config()?;
 
         // Client send Initial
@@ -4653,27 +5364,27 @@ pub(crate) mod tests {
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
 
         // Server send Initial and Handshake
-        let mut packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
         assert_eq!(test_pair.client.is_established(), false);
         assert_eq!(test_pair.client.flags.contains(HandshakeConfirmed), false);
         assert_eq!(test_pair.server.is_established(), false);
         assert_eq!(test_pair.server.flags.contains(HandshakeConfirmed), false);
 
-        // Client recv disordered Initial/Handshake packets. The Handshake
-        // packets arriving before the Initial packet are dropped by the client.
-        packets.reverse();
-        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        // Client recv Handshake before Initial.
+        TestPair::conn_packets_in(&mut test_pair.client, vec![packets[1].clone()])?;
         assert_eq!(test_pair.client.is_established(), false);
+        let undecryptable_handshake_packets =
+            &test_pair.client.undecryptable_packets.handshake_pkts;
+        assert_eq!(undecryptable_handshake_packets.is_empty(), false);
+        TestPair::conn_packets_in(&mut test_pair.client, vec![packets[0].clone()])?;
+        assert_eq!(test_pair.client.is_established(), true);
+        let undecryptable_handshake_packets =
+            &test_pair.client.undecryptable_packets.handshake_pkts;
+        assert_eq!(undecryptable_handshake_packets.is_empty(), true);
 
         // Client send Initial/Handshake(ack)
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
-
-        // Fake timing out server's timer
-        let timeout = test_pair.server.timeout();
-        assert!(timeout.is_some());
-        let now = time::Instant::now() + timeout.unwrap();
-        test_pair.server.on_timeout(now);
 
         // Continue handshake
         test_pair.handshake()?;
@@ -4754,6 +5465,71 @@ pub(crate) mod tests {
         // Server complete handshake
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
         let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert_eq!(test_pair.client.is_established(), true);
+        assert_eq!(test_pair.server.is_established(), true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn handshake_with_anti_amplification_deadlock() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+
+        // Client send Initial.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        // Server send Initial and Handshake.
+        let mut packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+
+        // Fake dropping the second Handshake packet.
+        packets.truncate(1);
+
+        // Client recv Initial and the first Handshake.
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(!test_pair.client.tls_session.is_completed());
+
+        // Client send ACK and PADDING and wait for retransmission of the second packet.
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Client must set LossDetection timer to avoid deadlock
+        assert!(test_pair.client.timeout().is_some());
+        assert!(test_pair.client.timers.get(Timer::LossDetection).is_some());
+
+        // Server retransmit Handshake but lost again
+        for i in 0..5 {
+            let dur = test_pair.server.timeout().unwrap();
+            test_pair.server.on_timeout(time::Instant::now() + dur);
+            let _ = TestPair::conn_packets_out(&mut test_pair.server)?;
+        }
+
+        // Server is blocked by anti-amplification limit
+        {
+            let path = test_pair.server.paths.get_active().unwrap();
+            assert_eq!(path.anti_ampl_limit, 0);
+        }
+
+        // A deadlock could occur when the server reaches its anti-amplification limit
+        // and the client has received acknowledgments for all the data it has sent.
+        // In this case, when the client has no reason to send additional packets, the
+        // server will be unable to send more data because it has not validated the
+        // client's address. To prevent this deadlock, clients MUST send a packet on a
+        // Probe Timeout (PTO).
+        let dur = test_pair.client.timeout().unwrap();
+        test_pair.client.on_timeout(time::Instant::now() + dur);
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(!packets.is_empty());
+
+        // Server and client continue the handshake.
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        {
+            let path = test_pair.server.paths.get_active().unwrap();
+            assert!(path.anti_ampl_limit > 0);
+        }
+        let dur = test_pair.server.timeout().unwrap();
+        test_pair.server.on_timeout(time::Instant::now() + dur);
+
+        assert_eq!(test_pair.handshake(), Ok(()));
         assert_eq!(test_pair.client.is_established(), true);
         assert_eq!(test_pair.server.is_established(), true);
 
@@ -4925,16 +5701,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn handshake_with_disable_encryption_negotiated() -> Result<()> {
+        let cases = [
+            // The items in each case are as following:
+            // - client disable_encryption
+            // - server disable_encryption
+            // - disable_encryption negotiation result
+            //(true, false, false),
+            //(false,false, false),
+            //(false, true, false),
+            (true, true, true),
+        ];
+        for case in cases {
+            let mut client_config = TestPair::new_test_config(false)?;
+            client_config.enable_encryption(!case.0);
+            let mut server_config = TestPair::new_test_config(true)?;
+            server_config.enable_encryption(!case.1);
+
+            let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+            assert_eq!(test_pair.handshake(), Ok(()));
+            assert_eq!(test_pair.client.flags.contains(DisableEncryption), case.2);
+            assert_eq!(test_pair.server.flags.contains(DisableEncryption), case.2);
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn max_datagram_size() -> Result<()> {
         let mut client_config = TestPair::new_test_config(false)?;
-        client_config.set_send_udp_payload_size(2000);
+        client_config.set_send_udp_payload_size(1200);
         let mut server_config = TestPair::new_test_config(true)?;
         server_config.set_recv_udp_payload_size(1550);
         server_config.set_initial_max_data(10000);
         server_config.set_initial_max_stream_data_bidi_remote(10000);
+        server_config.set_ack_eliciting_threshold(1);
         let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
-        assert_eq!(test_pair.handshake(), Ok(()));
+        assert_eq!(
+            test_pair.client.paths.get(0)?.recovery.max_datagram_size,
+            1200,
+        );
 
+        // Handshake and discovery path MTU
+        assert_eq!(test_pair.handshake(), Ok(()));
+        test_pair.move_forward()?;
+
+        // Check path MTU
+        let mds_ipv4 = 1472;
+        assert_eq!(
+            test_pair.client.paths.get(0)?.recovery.max_datagram_size,
+            mds_ipv4
+        );
+
+        // Check outgoing packet size
         let mut buf = vec![0; 2000];
         assert!(test_pair
             .client
@@ -4942,7 +5761,7 @@ pub(crate) mod tests {
             .is_ok());
         let r = test_pair.client.send(&mut buf);
         assert!(r.is_ok());
-        assert_eq!(r.unwrap().0, 1550);
+        assert_eq!(r.unwrap().0, mds_ipv4);
 
         Ok(())
     }
@@ -5260,7 +6079,7 @@ pub(crate) mod tests {
             .client
             .paths
             .get(pid)?
-            .need_send_validation_frames());
+            .need_send_validation_frames(false));
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
 
@@ -5316,6 +6135,177 @@ pub(crate) mod tests {
 
         assert!(test_pair.client.scid().is_err());
         assert!(test_pair.client.dcid().is_err());
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_anti_ampl_limit() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        {
+            let path = test_pair.server.paths.get_active().unwrap();
+            assert_eq!(path.anti_ampl_limit, 0);
+        }
+
+        // Client send Initial.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        let len_in: usize = packets.iter().map(|p| p.0.len()).sum();
+
+        // Server recv Initial.
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        {
+            let path = test_pair.server.paths.get_active().unwrap();
+            assert_eq!(
+                path.anti_ampl_limit,
+                len_in * test_pair.server.paths.anti_ampl_factor
+            );
+        }
+
+        // Server send Initial and Handshake.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        let len_out: usize = packets.iter().map(|p| p.0.len()).sum();
+        {
+            let path = test_pair.server.paths.get_active().unwrap();
+            assert_eq!(
+                path.anti_ampl_limit,
+                len_in * test_pair.server.paths.anti_ampl_factor - len_out
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_mtu_discovery_max() -> Result<()> {
+        let cases = [
+            // (cli_enable_dplpmtud, srv_enable_dplpmtud, cli_mtu , srv_mtu)
+            (false, false, 1200, 1200),
+            (false, true, 1200, 1472),
+            (true, false, 1472, 1200),
+            (true, true, 1472, 1472),
+        ];
+
+        for case in cases {
+            let mut client_config = TestPair::new_test_config(false)?;
+            client_config.enable_dplpmtud(case.0);
+            client_config.set_ack_eliciting_threshold(1);
+            let mut server_config = TestPair::new_test_config(true)?;
+            server_config.enable_dplpmtud(case.1);
+            server_config.set_ack_eliciting_threshold(1);
+            let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+            assert_eq!(test_pair.handshake(), Ok(()));
+
+            test_pair.move_forward()?;
+            assert_eq!(
+                test_pair.client.paths.get(0)?.recovery.max_datagram_size,
+                case.2
+            );
+            assert_eq!(
+                test_pair.server.paths.get(0)?.recovery.max_datagram_size,
+                case.3
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_mtu_discovery_lost() -> Result<()> {
+        let cases = [
+            // (router_mtu, searched_mtu)
+            (1472, 1463),
+            (1452, 1446),
+            (1432, 1429),
+            (1412, 1404),
+            (1392, 1387),
+            (1372, 1370),
+        ];
+
+        for case in cases {
+            let mut client_config = TestPair::new_test_config(false)?;
+            client_config.enable_dplpmtud(true);
+            client_config.set_ack_eliciting_threshold(1);
+            let mut server_config = TestPair::new_test_config(true)?;
+            server_config.enable_dplpmtud(false);
+            server_config.set_initial_max_data(10240);
+            server_config.set_initial_max_stream_data_bidi_remote(10240);
+            server_config.set_ack_eliciting_threshold(1);
+            let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+            let router_mtu: usize = case.0;
+
+            // Handshake
+            while !test_pair.client.is_established() || !test_pair.server.is_established() {
+                let mut packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+                packets.retain(|p| p.0.len() < router_mtu); // fake dropping packets
+                TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+                let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+                TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+            }
+
+            // Path MTU searching
+            let data = Bytes::from_static(b"data");
+            for i in 0..30 {
+                let _ = test_pair.client.stream_write(0, data.clone(), false);
+                let mut packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+                packets.retain(|p| p.0.len() < router_mtu); // fake dropping packets
+
+                TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+                let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+                TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+
+                if test_pair.client.timeout().is_some() {
+                    let timeout = test_pair.client.timers.get(Timer::LossDetection);
+                    test_pair.client.on_timeout(timeout.unwrap());
+                }
+            }
+
+            // Check final MTU
+            assert_eq!(
+                test_pair.client.paths.get(0)?.recovery.max_datagram_size,
+                case.1
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ping() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.enable_dplpmtud(false);
+        client_config.local_transport_params = TransportParams {
+            max_idle_timeout: 15000,
+            ..TransportParams::default()
+        };
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.enable_dplpmtud(false);
+        server_config.local_transport_params = TransportParams {
+            max_idle_timeout: 15000,
+            ..TransportParams::default()
+        };
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        test_pair.handshake()?;
+
+        // Move both connections to idle state
+        test_pair.move_forward()?;
+
+        // Enable qlog for Server
+        let slog = NamedTempFile::new().unwrap();
+        let mut sfile = slog.reopen().unwrap();
+        test_pair
+            .server
+            .set_qlog(Box::new(slog), "title".into(), "desc".into());
+
+        // Client send a Ping frame
+        test_pair.client.ping(None)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets.clone())?;
+
+        let mut slog_content = String::new();
+        sfile.read_to_string(&mut slog_content).unwrap();
+        assert_eq!(slog_content.contains("quic:packet_received"), true);
+        assert_eq!(slog_content.contains("frame_type\":\"ping"), true);
 
         Ok(())
     }
@@ -5477,7 +6467,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn recv_packet_invalid_length() -> Result<()> {
+    fn recv_packet_invalid_length_too_big() -> Result<()> {
         let mut test_pair = TestPair::new_with_test_config()?;
         let info = TestPair::new_test_packet_info(false);
 
@@ -5487,9 +6477,51 @@ pub(crate) mod tests {
 
         // Tamper Length field of the Initial packet
         let initial_pkt = &mut packets[0].0;
-        let initial_pkt_len = initial_pkt.len();
-        let mut len = &mut initial_pkt[47..49]; // length field
+        let mut len = &mut initial_pkt[48..50]; // length field
         len.write_varint_with_len(10000 as u64, 2)?;
+
+        // Server drop Initial packet with invalid length
+        assert_eq!(
+            TestPair::conn_packets_in(&mut test_pair.server, packets),
+            Ok(())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recv_packet_invalid_length_too_small() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(false);
+
+        // Client send Initial packet
+        let mut packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert!(packets.len() > 0);
+
+        // Tamper Length field of the Initial packet
+        let initial_pkt = &mut packets[0].0;
+        let mut len = &mut initial_pkt[48..50]; // length field
+        len.write_varint_with_len(1 as u64, 2)?;
+
+        // Server drop Initial packet with invalid length
+        assert_eq!(
+            TestPair::conn_packets_in(&mut test_pair.server, packets),
+            Ok(())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recv_packet_invalid_length_variant_error() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        let info = TestPair::new_test_packet_info(false);
+
+        // Client send Initial.
+        let mut packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Tamper Length field of the Initial packet
+        let initial_pkt = &mut packets[0].0;
+        initial_pkt[48] = 0;
+        initial_pkt[49] = 0;
 
         // Server drop Initial packet with invalid length
         assert_eq!(
@@ -5594,7 +6626,11 @@ pub(crate) mod tests {
 
     #[test]
     fn recv_packet_skipped_packet_number() -> Result<()> {
-        let mut test_pair = TestPair::new_with_test_config()?;
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.enable_dplpmtud(false);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.enable_dplpmtud(false);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
         assert_eq!(test_pair.handshake(), Ok(()));
 
         let info = TestPair::new_test_packet_info(false);
@@ -5605,7 +6641,7 @@ pub(crate) mod tests {
             let packet = TestPair::conn_build_packet(
                 &mut test_pair.client,
                 PacketType::OneRTT,
-                &[frame::Frame::Ping],
+                &[frame::Frame::Ping { pmtu_probe: None }],
             )?;
 
             // Server recv OneRTT packet and send ack
@@ -5639,7 +6675,7 @@ pub(crate) mod tests {
                 TestPair::conn_build_packet(
                     &mut test_pair.client,
                     PacketType::OneRTT,
-                    &[frame::Frame::Ping],
+                    &[frame::Frame::Ping { pmtu_probe: None }],
                 )?,
                 info,
             ));
@@ -5654,6 +6690,122 @@ pub(crate) mod tests {
             let space = test_pair.server.spaces.get(SpaceId::Data).unwrap();
             assert!(space.consecutive_non_ack_eliciting_sent <= space::MAX_NON_ACK_ELICITING);
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ack_initial_or_handshake_space() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_ack_eliciting_threshold(2);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_ack_eliciting_threshold(2);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+
+        // Client send 1 UDP datagram carrying 1 Initial packet
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        assert_eq!(packets.len(), 1);
+
+        // Server send 2 UDP datagrams carrying 1 Initial packet and 2 Handshake packets
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert_eq!(packets.len(), 2);
+
+        // Client's Initial must be acknowledged immediately
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        {
+            let stat = test_pair.client.paths.get_active_mut()?.stats();
+            assert_eq!(stat.acked_count, 1);
+        }
+
+        // Client send Handshake and completes handshake.
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Server's Initial/Handshake must be acknowledged immediately
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        {
+            let stat = test_pair.server.paths.get_active_mut()?.stats();
+            assert_eq!(stat.acked_count, 3);
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ack_data_space_ack_eliciting_threshold() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_ack_eliciting_threshold(4);
+        client_config.enable_dplpmtud(false);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_ack_eliciting_threshold(4);
+        server_config.enable_dplpmtud(false);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+        test_pair.move_forward()?;
+
+        let data = Bytes::from_static(b"QUIC");
+        let sid = test_pair.client.stream_bidi_new(0, false)?;
+        let acked_pkts = test_pair.client.paths.get_active_mut()?.stats().acked_count;
+
+        for i in 0..4 {
+            // Client write data on the stream
+            test_pair.client.stream_write(sid, data.clone(), false)?;
+            let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+            // Server recv packets from the client
+            TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+            let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+
+            TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+            let new_acked_pkts = test_pair.client.paths.get_active_mut()?.stats().acked_count;
+            if i < 3 {
+                assert_eq!(acked_pkts, new_acked_pkts);
+            } else {
+                assert_eq!(acked_pkts + 4, new_acked_pkts);
+            }
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn ack_data_space_ack_timeout() -> Result<()> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_ack_eliciting_threshold(4);
+        client_config.enable_dplpmtud(false);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_ack_eliciting_threshold(4);
+        server_config.enable_dplpmtud(false);
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+        test_pair.move_forward()?;
+
+        let data = Bytes::from_static(b"QUIC");
+        let sid = test_pair.client.stream_bidi_new(0, false)?;
+        let acked_pkts = test_pair.client.paths.get_active_mut()?.stats().acked_count;
+
+        // Client write data on the stream
+        test_pair.client.stream_write(sid, data.clone(), false)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Server recv packets from the client
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        assert_eq!(packets.len(), 0);
+
+        // Advance server ticks until ack timeout
+        assert!(test_pair.server.timeout().is_some());
+        let ack_timeout = test_pair.server.timers.get(Timer::Ack);
+        assert!(ack_timeout.is_some());
+        let now = ack_timeout.unwrap();
+        test_pair.server.on_timeout(now);
+
+        // Server send ack
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        let new_acked_pkts = test_pair.client.paths.get_active_mut()?.stats().acked_count;
+        assert_eq!(acked_pkts + 1, new_acked_pkts);
 
         Ok(())
     }
@@ -6037,13 +7189,14 @@ pub(crate) mod tests {
     #[test]
     fn conn_multi_incremental_streams_send_round_robin() -> Result<()> {
         let server_transport_params = TransportParams {
-            initial_max_data: 2000,
-            initial_max_stream_data_bidi_remote: 2000,
+            initial_max_data: 20000,
+            initial_max_stream_data_bidi_remote: 20000,
             initial_max_streams_bidi: 4,
             ..TransportParams::default()
         };
 
         let mut client_config = TestPair::new_test_config(false)?;
+        client_config.enable_dplpmtud(false);
         let mut server_config = TestPair::new_test_config(true)?;
         server_config.local_transport_params = server_transport_params.clone();
 
@@ -6051,7 +7204,7 @@ pub(crate) mod tests {
         assert_eq!(test_pair.handshake(), Ok(()));
 
         // 1. Client create four bidi streams [0, 4, 8, 12], and write data on them
-        let data = TestPair::new_test_data(500);
+        let data = TestPair::new_test_data(1000);
         for i in 0..4 {
             assert_eq!(
                 test_pair.client.stream_write(i * 4, data.clone(), true)?,
@@ -6062,7 +7215,7 @@ pub(crate) mod tests {
         // 2. Try to send stream data in round-robin order
         let mut packets = Vec::new();
         for i in 0..4 {
-            let mut out = vec![0u8; 100];
+            let mut out = vec![0u8; 1500];
             let info = match test_pair.client.send(&mut out) {
                 Ok((written, info)) => {
                     out.truncate(written);
@@ -6084,20 +7237,26 @@ pub(crate) mod tests {
 
     #[test]
     fn conn_max_streams_bidi() -> Result<()> {
-        let mut test_pair = TestPair::new_with_test_config()?;
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_ack_eliciting_threshold(1);
+        let mut server_config = TestPair::new_test_config(true)?;
+
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+
         assert_eq!(test_pair.handshake(), Ok(()));
 
         // Client create bidi streams
         let data = TestPair::new_test_data(5);
-        for i in 0..3 {
+        for _ in 0..3 {
+            let sid = test_pair.client.stream_bidi_new(0, false)?;
             assert_eq!(
-                test_pair.client.stream_write(i * 4, data.clone(), true)?,
+                test_pair.client.stream_write(sid, data.clone(), true)?,
                 data.len()
             );
         }
         // Client fail to create more streams
         assert_eq!(
-            test_pair.client.stream_write(16, data.clone(), true),
+            test_pair.client.stream_bidi_new(0, false),
             Err(Error::StreamLimitError)
         );
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
@@ -6138,17 +7297,16 @@ pub(crate) mod tests {
 
         // Client create uni streams
         let data = TestPair::new_test_data(5);
-        for i in 0..2 {
+        for _ in 0..2 {
+            let sid = test_pair.client.stream_uni_new(0, false)?;
             assert_eq!(
-                test_pair
-                    .client
-                    .stream_write(2 + i * 4, data.clone(), true)?,
+                test_pair.client.stream_write(sid, data.clone(), true)?,
                 data.len()
             );
         }
         // Client fail to create more streams
         assert_eq!(
-            test_pair.client.stream_write(10, data.clone(), true),
+            test_pair.client.stream_uni_new(0, false),
             Err(Error::StreamLimitError)
         );
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
@@ -6243,7 +7401,13 @@ pub(crate) mod tests {
 
     #[test]
     fn stream_reset() -> Result<()> {
-        let mut test_pair = TestPair::new_with_test_config()?;
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_ack_eliciting_threshold(1);
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_ack_eliciting_threshold(1);
+
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+
         assert_eq!(test_pair.handshake(), Ok(()));
         let mut buf = vec![0; 16];
 
@@ -6270,11 +7434,62 @@ pub(crate) mod tests {
             Err(Error::StreamReset(2))
         );
 
-        // Client send RESET_STREAM
+        // Client send ACK/RESET_STREAM
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
 
-        // Server recv RESET_STREAM
+        // Server recv ACK/RESET_STREAM
         TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        assert_eq!(test_pair.server.streams.is_closed(sid), true);
+        assert_eq!(test_pair.server.stream_readable(sid), false);
+        assert_eq!(
+            test_pair.server.stream_read(sid, &mut buf),
+            Err(Error::StreamStateError)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn stream_shutdown_abnormal() -> Result<()> {
+        let mut test_pair = TestPair::new_with_test_config()?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+        let mut buf = vec![0; 16];
+
+        // Client send data on a stream
+        let (sid, data) = (0, TestPair::new_test_data(10));
+        test_pair.client.stream_write(sid, data.clone(), false)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Server shutdown the stream (Read/Write)
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        test_pair.server.stream_shutdown(sid, Shutdown::Read, 1)?;
+        test_pair.server.stream_shutdown(sid, Shutdown::Write, 2)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+
+        // Client recv STOP_SENDING/RESET_STREAM
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+
+        // Client send ACK
+        let mut ack_ranges = RangeSet::new(1);
+        ack_ranges.insert(0..2);
+        let frame = frame::Frame::Ack {
+            ack_delay: 0,
+            ack_ranges,
+            ecn_counts: None,
+        };
+        test_pair.build_packet_and_send(PacketType::OneRTT, &[frame], false)?;
+        assert_eq!(test_pair.server.streams.is_closed(sid), false);
+
+        // Client send RESET_STREAM
+        let frame = frame::Frame::ResetStream {
+            stream_id: 0,
+            error_code: 1,
+            final_size: 10,
+        };
+        test_pair.build_packet_and_send(PacketType::OneRTT, &[frame], false)?;
+
+        // Server stream 0 should be closed now
+        assert_eq!(test_pair.server.streams.is_closed(sid), true);
         assert_eq!(test_pair.server.stream_readable(sid), false);
         assert_eq!(
             test_pair.server.stream_read(sid, &mut buf),
@@ -6337,12 +7552,12 @@ pub(crate) mod tests {
         let mut client_config = TestPair::new_test_config(false)?;
         client_config.set_cid_len(crate::MAX_CID_LEN);
         client_config.enable_multipath(true);
-        client_config.set_multipath_algor(MultipathAlgorithm::MinRtt);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
 
         let mut server_config = TestPair::new_test_config(true)?;
         server_config.set_cid_len(crate::MAX_CID_LEN);
         server_config.enable_multipath(true);
-        server_config.set_multipath_algor(MultipathAlgorithm::MinRtt);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::MinRtt);
 
         let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
         let mut blocks = vec![];
@@ -6360,13 +7575,15 @@ pub(crate) mod tests {
         let mut client_config = TestPair::new_test_config(false)?;
         client_config.set_cid_len(crate::MAX_CID_LEN);
         client_config.enable_multipath(true);
-        client_config.set_multipath_algor(MultipathAlgorithm::Redundant);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::Redundant);
+        client_config.set_ack_eliciting_threshold(1);
         let mut server_config = TestPair::new_test_config(true)?;
         server_config.set_cid_len(crate::MAX_CID_LEN);
 
         // Handshake with multipath enabled
         server_config.enable_multipath(true);
-        server_config.set_multipath_algor(MultipathAlgorithm::Redundant);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::Redundant);
+        server_config.set_ack_eliciting_threshold(1);
         let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
 
         let blocks = vec![
@@ -6377,7 +7594,7 @@ pub(crate) mod tests {
 
         conn_multipath_transfer(&mut test_pair, blocks)?;
 
-        for (i, path) in test_pair.server.paths.iter() {
+        for (i, path) in test_pair.server.paths.iter_mut() {
             let s = path.stats();
             assert!(s.sent_count > 3);
             assert!(s.recv_count > 3);
@@ -6390,12 +7607,14 @@ pub(crate) mod tests {
         let mut client_config = TestPair::new_test_config(false)?;
         client_config.set_cid_len(crate::MAX_CID_LEN);
         client_config.enable_multipath(true);
-        client_config.set_multipath_algor(MultipathAlgorithm::RoundRobin);
+        client_config.set_multipath_algorithm(MultipathAlgorithm::RoundRobin);
+        client_config.set_ack_eliciting_threshold(1);
 
         let mut server_config = TestPair::new_test_config(true)?;
         server_config.set_cid_len(crate::MAX_CID_LEN);
         server_config.enable_multipath(true);
-        server_config.set_multipath_algor(MultipathAlgorithm::RoundRobin);
+        server_config.set_multipath_algorithm(MultipathAlgorithm::RoundRobin);
+        server_config.set_ack_eliciting_threshold(1);
 
         let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
         let mut blocks = vec![];
@@ -6404,7 +7623,7 @@ pub(crate) mod tests {
         }
         conn_multipath_transfer(&mut test_pair, blocks)?;
 
-        for (i, path) in test_pair.server.paths.iter() {
+        for (i, path) in test_pair.server.paths.iter_mut() {
             let s = path.stats();
             assert!(s.sent_count > 50);
             assert!(s.recv_count > 50);
@@ -6420,44 +7639,235 @@ pub(crate) mod tests {
         let mut sfile = slog.reopen().unwrap();
 
         let mut test_pair = TestPair::new_with_test_config()?;
-        assert_eq!(test_pair.handshake(), Ok(()));
         test_pair
             .client
             .set_qlog(Box::new(clog), "title".into(), "desc".into());
         test_pair
             .server
             .set_qlog(Box::new(slog), "title".into(), "desc".into());
+        assert_eq!(test_pair.handshake(), Ok(()));
 
         // Client create a stream and send data
         let data = Bytes::from_static(b"test data over quic");
-        test_pair.client.stream_set_priority(0, 0, false)?;
-        test_pair.client.stream_write(0, data.clone(), true)?;
-        test_pair.client.stream_shutdown(0, Shutdown::Read, 0)?;
+        test_pair.client.stream_write(0, data.clone(), false)?;
         let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+
+        // Client lost some packets
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let _ = TestPair::conn_packets_out(&mut test_pair.client)?;
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
 
         // Server read data from the stream
-        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
         let mut buf = vec![0; data.len()];
         test_pair.server.stream_read(0, &mut buf)?;
-
         let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
         TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+
+        // The dropped packets may be declared as lost based on the time threshold.
+        // If not, advance ticks until loss timeout.
+        if test_pair.client.timeout().is_some() {
+            let timeout = test_pair.client.timers.get(Timer::LossDetection);
+            test_pair.client.on_timeout(timeout.unwrap());
+        }
 
         // Check client qlog
         let mut clog_content = String::new();
         cfile.read_to_string(&mut clog_content).unwrap();
         assert_eq!(clog_content.contains("client"), true);
-        assert_eq!(clog_content.contains("transport:parameters_set"), true);
-        assert_eq!(clog_content.contains("transport:data_moved"), true);
-        assert_eq!(clog_content.contains("transport:packet_sent"), true);
+        assert_eq!(clog_content.contains("quic:parameters_set"), true);
+        assert_eq!(clog_content.contains("quic:stream_data_moved"), true);
+        assert_eq!(clog_content.contains("quic:packet_sent"), true);
+        assert_eq!(clog_content.contains("recovery:metrics_updated"), true);
+        assert_eq!(clog_content.contains("recovery:packet_lost"), true);
 
         // Check server qlog
         let mut slog_content = String::new();
         sfile.read_to_string(&mut slog_content).unwrap();
         assert_eq!(slog_content.contains("server"), true);
-        assert_eq!(slog_content.contains("transport:parameters_set"), true);
-        assert_eq!(slog_content.contains("transport:data_moved"), true);
-        assert_eq!(slog_content.contains("transport:packet_received"), true);
+        assert_eq!(slog_content.contains("quic:parameters_set"), true);
+        assert_eq!(slog_content.contains("quic:stream_data_moved"), true);
+        assert_eq!(slog_content.contains("quic:packet_received"), true);
+        assert_eq!(slog_content.contains("recovery:metrics_updated"), true);
+
+        Ok(())
+    }
+
+    fn test_pair_for_key_update() -> Result<TestPair> {
+        let mut client_config = TestPair::new_test_config(false)?;
+        client_config.set_cid_len(crate::MAX_CID_LEN);
+        client_config.set_initial_max_data(10000);
+        client_config.set_initial_max_stream_data_bidi_local(10000);
+        client_config.set_initial_max_stream_data_bidi_remote(10000);
+
+        let mut server_config = TestPair::new_test_config(true)?;
+        server_config.set_cid_len(crate::MAX_CID_LEN);
+        server_config.set_initial_max_data(10000);
+        server_config.set_initial_max_stream_data_bidi_local(10000);
+        server_config.set_initial_max_stream_data_bidi_remote(10000);
+
+        let mut test_pair = TestPair::new(&mut client_config, &mut server_config)?;
+        assert_eq!(test_pair.handshake(), Ok(()));
+
+        // Transfer some data.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let mut buf = vec![0; 2048];
+        assert_eq!(test_pair.server.stream_read(0, &mut buf)?, (19, false));
+        assert_eq!(&buf[..19], &data[..]);
+
+        // Server reply ack.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(!test_pair.client.tls_session.current_key_phase());
+        assert!(!test_pair.server.tls_session.current_key_phase());
+
+        Ok(test_pair)
+    }
+
+    #[test]
+    fn key_update() -> Result<()> {
+        let mut test_pair = test_pair_for_key_update()?;
+
+        // Client init key update.
+        let space = test_pair
+            .client
+            .spaces
+            .get_mut(SpaceId::Data)
+            .ok_or(Error::InternalError)?;
+        test_pair
+            .client
+            .tls_session
+            .initiate_key_update(space, false)?;
+
+        // Transfer some data.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+        TestPair::conn_packets_in(&mut test_pair.server, packets)?;
+        let mut buf = vec![0; 2048];
+        assert_eq!(test_pair.server.stream_read(0, &mut buf)?, (19, false));
+        assert_eq!(&buf[..19], &data[..]);
+
+        // Server reply ack.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(test_pair.client.tls_session.current_key_phase());
+        assert!(test_pair.server.tls_session.current_key_phase());
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_update_with_packet_reorder() -> Result<()> {
+        let mut test_pair = test_pair_for_key_update()?;
+
+        // Client send data.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let prev_key_packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Client init key update.
+        let space = test_pair
+            .client
+            .spaces
+            .get_mut(SpaceId::Data)
+            .ok_or(Error::InternalError)?;
+        test_pair
+            .client
+            .tls_session
+            .initiate_key_update(space, false)?;
+
+        // Client send with new key.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), true)?;
+        let new_key_packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Server receive reordered packets.
+        TestPair::conn_packets_in(&mut test_pair.server, new_key_packets)?;
+        TestPair::conn_packets_in(&mut test_pair.server, prev_key_packets)?;
+        let mut buf = vec![0; 2048];
+        assert_eq!(test_pair.server.stream_read(0, &mut buf)?, (38, true));
+
+        // Server reply ack.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(test_pair.client.tls_session.current_key_phase());
+        assert!(test_pair.server.tls_session.current_key_phase());
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_update_with_previous_key_discard() -> Result<()> {
+        let mut test_pair = test_pair_for_key_update()?;
+
+        // Client send data.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), false)?;
+        let prev_key_packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Client init key update.
+        let space = test_pair
+            .client
+            .spaces
+            .get_mut(SpaceId::Data)
+            .ok_or(Error::InternalError)?;
+        test_pair
+            .client
+            .tls_session
+            .initiate_key_update(space, false)?;
+        // Client send with new key.
+        let data = Bytes::from_static(b"test data over quic");
+        test_pair.client.stream_write(0, data.clone(), true)?;
+        let new_key_packets = TestPair::conn_packets_out(&mut test_pair.client)?;
+
+        // Server discard previous key and receive reordered packets.
+        TestPair::conn_packets_in(&mut test_pair.server, new_key_packets)?;
+
+        let timeout = test_pair.server.timers.get(Timer::KeyDiscard);
+        test_pair.server.on_timeout(timeout.unwrap());
+
+        TestPair::conn_packets_in(&mut test_pair.server, prev_key_packets)?;
+        let mut buf = vec![0; 2048];
+        assert_eq!(test_pair.server.stream_read(0, &mut buf), Err(Error::Done));
+
+        // Server reply ack.
+        let packets = TestPair::conn_packets_out(&mut test_pair.server)?;
+        TestPair::conn_packets_in(&mut test_pair.client, packets)?;
+        assert!(test_pair.client.tls_session.current_key_phase());
+        assert!(test_pair.server.tls_session.current_key_phase());
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_update_with_consecutive_update() -> Result<()> {
+        let mut test_pair = test_pair_for_key_update()?;
+
+        // Client init key update.
+        let space = test_pair
+            .client
+            .spaces
+            .get_mut(SpaceId::Data)
+            .ok_or(Error::InternalError)?;
+        test_pair
+            .client
+            .tls_session
+            .initiate_key_update(space, false)?;
+
+        // Client init another key update.
+        assert_eq!(
+            test_pair
+                .client
+                .tls_session
+                .initiate_key_update(space, false),
+            Err(Error::Done)
+        );
 
         Ok(())
     }
@@ -6466,8 +7876,9 @@ pub(crate) mod tests {
 mod cid;
 mod flowcontrol;
 pub mod path;
+mod pmtu;
 mod recovery;
 pub(crate) mod rtt;
 pub(crate) mod space;
 pub(crate) mod stream;
-mod timer;
+pub(crate) mod timer;

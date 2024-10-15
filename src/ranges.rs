@@ -16,6 +16,7 @@ use std::ops::Range;
 
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::Bound::Excluded;
 use std::collections::Bound::Included;
 use std::collections::Bound::Unbounded;
 
@@ -124,6 +125,11 @@ impl RangeSet {
         }
     }
 
+    /// Remove `elem` from the set, i.e. remove range [elem, elem + 1) from the set.
+    pub fn remove_elem(&mut self, elem: u64) {
+        self.remove(elem..elem + 1);
+    }
+
     /// Remove all ranges that are smaller or equal to `elem` from the set.
     pub fn remove_until(&mut self, elem: u64) {
         let ranges: Vec<Range<u64>> = self
@@ -165,7 +171,7 @@ impl RangeSet {
             }
         }
 
-        if let Some(r) = self.next_to(range.start) {
+        if let Some(r) = self.next_after(range.start) {
             if r.start < range.end {
                 new_end = r.start
             }
@@ -211,7 +217,7 @@ impl RangeSet {
         }
     }
 
-    /// Find the closest range to `elem` that begins at or before it.
+    /// Find the closest range to `elem` that begins *at* or before it.
     fn prev_to(&self, elem: u64) -> Option<Range<u64>> {
         self.set
             .range((Unbounded, Included(elem)))
@@ -219,12 +225,35 @@ impl RangeSet {
             .next_back()
     }
 
-    /// Find the closest range to `elem` that begins after it.
+    /// Find the closest range to `elem` that begins *at* or after it.
     fn next_to(&self, elem: u64) -> Option<Range<u64>> {
         self.set
             .range((Included(elem), Unbounded))
             .map(|(&s, &e)| (s..e))
             .next()
+    }
+
+    /// Find the closest range to `elem` that begins after it.
+    fn next_after(&self, elem: u64) -> Option<Range<u64>> {
+        self.set
+            .range((Excluded(elem), Unbounded))
+            .map(|(&s, &e)| (s..e))
+            .next()
+    }
+
+    /// Check if the element exists or not
+    pub fn contains(&self, elem: u64) -> bool {
+        if let Some(prev) = self.prev_to(elem) {
+            if prev.contains(&elem) {
+                return true;
+            }
+        }
+        if let Some(next) = self.next_to(elem) {
+            if next.contains(&elem) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Peek at the smallest range in the set.
@@ -243,7 +272,7 @@ impl RangeSet {
 
 impl Default for RangeSet {
     fn default() -> Self {
-        Self::new(std::usize::MAX)
+        Self::new(usize::MAX)
     }
 }
 
@@ -790,6 +819,7 @@ mod tests {
 
     #[test]
     fn filter() {
+        // simple cases
         let cases = [
             (vec![2..4, 6..8], 0..2, Some(0..2)),
             (vec![2..4, 6..8], 4..6, Some(4..6)),
@@ -797,10 +827,21 @@ mod tests {
             (vec![], 8..9, Some(8..9)),
             (vec![2..4, 6..8], 2..4, None),
             (vec![2..4, 6..8], 6..8, None),
+            (vec![2..4, 6..8], 2..3, None),
+            (vec![2..4, 6..8], 3..4, None),
+            (vec![2..4, 6..8], 6..7, None),
+            (vec![2..4, 6..8], 7..8, None),
+            (vec![2..4, 6..8], 0..4, Some(0..2)),
+            (vec![2..4, 6..8], 2..5, Some(4..5)),
+            (vec![2..4, 6..8], 5..8, Some(5..6)),
+            (vec![2..4, 6..8], 6..9, Some(8..9)),
             (vec![2..4, 6..8], 3..5, Some(4..5)),
             (vec![2..4, 6..8], 7..9, Some(8..9)),
             (vec![2..4, 6..8], 0..3, Some(0..2)),
             (vec![2..4, 6..8], 5..7, Some(5..6)),
+            (vec![2..4, 6..8], 0..5, Some(0..2)),
+            (vec![2..4, 6..8], 5..9, Some(5..6)),
+            (vec![2..4, 6..8], 3..7, Some(4..6)),
             (vec![2..4, 6..8], 3..9, Some(4..6)),
             (vec![2..4, 6..8], 0..7, Some(0..2)),
             (vec![2..4, 6..8], 0..9, Some(0..2)),
@@ -811,6 +852,32 @@ mod tests {
                 rs.insert(r);
             }
             assert_eq!(rs.filter(case.1), case.2);
+        }
+
+        // all cases
+        let mut rs = RangeSet::default();
+        for r in vec![2..4, 6..8] {
+            rs.insert(r);
+        }
+        for i in 0..10 {
+            for j in i + 1..11 {
+                let res = rs.filter(i..j);
+                if (i < 2 && j <= 2) || (i >= 4 && j <= 6) || i >= 8 {
+                    assert_eq!(res, Some(i..j), "{:?} want {:?}, got {:?}", i..j, i..j, res)
+                } else if i < 2 && j > 2 {
+                    assert_eq!(res, Some(i..2), "{:?} want {:?}, got {:?}", i..j, i..2, res)
+                } else if i >= 2 && i <= 4 && j > 4 && j <= 6 {
+                    assert_eq!(res, Some(4..j), "{:?} want {:?}, got {:?}", i..j, 4..j, res)
+                } else if i >= 2 && i <= 4 && j > 6 {
+                    assert_eq!(res, Some(4..6), "{:?} want {:?}, got {:?}", i..j, 4..6, res)
+                } else if i >= 4 && i < 6 && j >= 6 {
+                    assert_eq!(res, Some(i..6), "{:?} want {:?}, got {:?}", i..j, i..6, res)
+                } else if i >= 6 && i < 8 && j > 8 {
+                    assert_eq!(res, Some(8..j), "{:?} want {:?}, got {:?}", i..j, 8..j, res)
+                } else {
+                    assert_eq!(res, None, "{:?} want None, got {:?}", i..j, res)
+                }
+            }
         }
     }
 
@@ -934,6 +1001,30 @@ mod tests {
 
         for i in [23, 27, 28] {
             assert_eq!(r.next_to(i), None);
+        }
+    }
+
+    #[test]
+    fn contains() {
+        let mut r = RangeSet::default();
+        // Insert ranges: [2..6), [8, 13)
+        r.insert(2..6);
+        r.insert(8..13);
+
+        for i in [0, 1] {
+            assert_eq!(r.contains(i), false);
+        }
+        for i in 2..6 {
+            assert_eq!(r.contains(i), true);
+        }
+        for i in [6, 7] {
+            assert_eq!(r.contains(i), false);
+        }
+        for i in 8..13 {
+            assert_eq!(r.contains(i), true);
+        }
+        for i in 13..20 {
+            assert_eq!(r.contains(i), false);
         }
     }
 

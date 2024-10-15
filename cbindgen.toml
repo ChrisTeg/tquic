@@ -15,20 +15,22 @@ cpp_compat = true
 documentation = true
 
 # A list of headers to #include (with quotes)
-sys_includes = ["sys/socket.h", "sys/types.h"]
+includes = ["openssl/ssl.h", "tquic_def.h"]
 
 [export]
-exclude = ["MAX_CID_LEN", "MIN_CLIENT_INITIAL_LEN"]
+exclude = ["MIN_CLIENT_INITIAL_LEN", "VINT_MAX"]
 
 [export.rename]
 "Config" = "quic_config_t"
 "TlsConfig" = "quic_tls_config_t"
 "SslCtx" = "SSL_CTX"
 "Connection" = "quic_conn_t"
+"ConnectionStats" = "quic_conn_stats_t"
 "Endpoint" = "quic_endpoint_t"
 "PacketOutSpec" = "quic_packet_out_spec_t"
 "PacketInfo" = "quic_packet_info_t"
 "PathAddress" = "quic_path_address_t"
+"PathStats" = "quic_path_stats_t"
 "FourTupleIter" = "quic_path_address_iter_t"
 "Shutdown" = "quic_shutdown"
 "TransportHandler" = "quic_transport_handler_t"
@@ -40,6 +42,7 @@ exclude = ["MAX_CID_LEN", "MIN_CLIENT_INITIAL_LEN"]
 "TlsConfigSelectMethods" = "quic_tls_config_select_methods_t"
 "TlsConfigSelectorContext" = "quic_tls_config_select_context_t"
 "CongestionControlAlgorithm" = "quic_congestion_control_algorithm"
+"MultipathAlgorithm" = "quic_multipath_algorithm"
 "LevelFilter" = "quic_log_level"
 "Http3Connection" = "http3_conn_t"
 "Http3Config" = "http3_config_t"

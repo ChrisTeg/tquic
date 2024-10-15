@@ -15,16 +15,22 @@
 use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
+use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::time;
+use std::time::Duration;
+use std::time::Instant;
 
 use slab::Slab;
 
+use super::pmtu::Dplpmtud;
 use super::recovery::Recovery;
 use super::timer;
 use crate::connection::SpaceId;
 use crate::error::Error;
 use crate::multipath_scheduler::MultipathScheduler;
+use crate::FourTuple;
+use crate::PathStats;
 use crate::RecoveryConfig;
 use crate::Result;
 use crate::TIMER_GRANULARITY;
@@ -33,24 +39,9 @@ pub(crate) const INITIAL_CHAL_TIMEOUT: u64 = 25;
 
 pub(crate) const MAX_PROBING_TIMEOUTS: usize = 8;
 
-/// The states about the path validation.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PathState {
-    /// The path validation failed
-    Failed,
+pub(crate) const MAX_PATH_CHALS_RECV: usize = 8;
 
-    /// No path validation has been performed.
-    Unknown,
-
-    /// The path is under validation.
-    Validating,
-
-    /// The remote address has been validated, but not the path MTU.
-    ValidatingMTU,
-
-    /// The path has been validated.
-    Validated,
-}
+pub(crate) const MIN_PATH_PROBE_SIZE: usize = 64;
 
 /// A network path on which QUIC packets can be sent.
 pub struct Path {
@@ -73,9 +64,6 @@ pub struct Path {
     /// Loss recovery and congestion control.
     pub(crate) recovery: Recovery,
 
-    /// Statistics about the path.
-    pub(super) stats: PathStats,
-
     /// The current validation state of the path.
     state: PathState,
 
@@ -83,7 +71,7 @@ pub struct Path {
     recv_chals: VecDeque<[u8; 8]>,
 
     /// Pending challenge data with the size of the packet containing them.
-    sent_chals: VecDeque<([u8; 8], usize, time::Instant)>,
+    sent_chals: VecDeque<([u8; 8], usize, time::Instant, time::Instant)>,
 
     /// Whether it requires sending PATH_CHALLENGE?
     need_send_challenge: bool,
@@ -101,7 +89,13 @@ pub struct Path {
     pub(super) peer_verified_local_address: bool,
 
     /// Total bytes the server can send before the client's address is verified.
-    pub(super) max_send_bytes: usize,
+    pub(super) anti_ampl_limit: usize,
+
+    /// The current pmtu probing state of the path.
+    pub(super) dplpmtud: Dplpmtud,
+
+    /// Whether a Ping frame should be sent on the path.
+    pub(super) need_send_ping: bool,
 
     /// Trace id.
     trace_id: String,
@@ -128,6 +122,12 @@ impl Path {
             (PathState::Unknown, None, None)
         };
 
+        let dplpmtud = Dplpmtud::new(
+            conf.enable_dplpmtud,
+            conf.max_datagram_size,
+            Self::is_ipv6(&remote_addr),
+        );
+
         Self {
             local_addr,
             remote_addr,
@@ -135,7 +135,6 @@ impl Path {
             dcid_seq,
             active: false,
             recovery: Recovery::new(conf),
-            stats: PathStats::default(),
             state,
             recv_chals: VecDeque::new(),
             sent_chals: VecDeque::new(),
@@ -144,7 +143,9 @@ impl Path {
             max_challenge_size: 0,
             verified_peer_address: false,
             peer_verified_local_address: false,
-            max_send_bytes: 0,
+            anti_ampl_limit: 0,
+            dplpmtud,
+            need_send_ping: false,
             trace_id: trace_id.to_string(),
             space_id: SpaceId::Data,
             is_abandon: false,
@@ -170,14 +171,19 @@ impl Path {
 
     /// Handle incoming PATH_CHALLENGE data.
     pub(super) fn on_path_chal_received(&mut self, data: [u8; 8]) {
+        if self.recv_chals.len() >= MAX_PATH_CHALS_RECV {
+            let _ = self.recv_chals.pop_front();
+        }
+
         self.recv_chals.push_back(data);
         self.peer_verified_local_address = true;
     }
 
     /// Handle incoming PATH_RESPONSE data.
-    pub(super) fn on_path_resp_received(&mut self, data: [u8; 8], multipath: bool) {
+    /// Return true if the path status changes to `Validated`.
+    pub(super) fn on_path_resp_received(&mut self, data: [u8; 8], multipath: bool) -> bool {
         if self.state == PathState::Validated {
-            return;
+            return false;
         }
 
         self.verified_peer_address = true;
@@ -185,9 +191,14 @@ impl Path {
 
         // The 4-tuple is reachable, but we didn't check Path MTU yet.
         let mut challenge_size = 0;
-        self.sent_chals.retain(|(d, s, _)| {
+        self.sent_chals.retain(|(d, s, sent_time, _)| {
             if *d == data {
                 challenge_size = *s;
+                // Use the delay between sending a PATH_CHALLENGE and receiving a PATH_RESPONSE
+                // to set the initial RTT for the new path. This delay should not be considered
+                // an RTT sample.
+                let initial_rtt = Instant::now().duration_since(*sent_time);
+                self.recovery.rtt.try_set_init_rtt(initial_rtt);
                 false
             } else {
                 true
@@ -201,11 +212,12 @@ impl Path {
             self.promote_to(PathState::Validated);
             self.set_active(multipath);
             self.sent_chals.clear();
-            return;
+            return true;
         }
 
         // If the MTU was not validated, probe again.
         self.need_send_challenge = true;
+        false
     }
 
     /// Fetch a received challenge data item.
@@ -237,7 +249,8 @@ impl Path {
         let loss_time =
             sent_time + time::Duration::from_millis(INITIAL_CHAL_TIMEOUT << self.lost_chal);
 
-        self.sent_chals.push_back((data, pkt_size, loss_time));
+        self.sent_chals
+            .push_back((data, pkt_size, sent_time, loss_time));
     }
 
     /// Handle timeout of PATH_CHALLENGE
@@ -248,7 +261,7 @@ impl Path {
 
         // Remove the lost challenges.
         while let Some(first_chal) = self.sent_chals.front() {
-            if first_chal.2 > now {
+            if first_chal.3 > now {
                 return;
             }
 
@@ -269,8 +282,24 @@ impl Path {
     }
 
     /// Whether PATH_CHALLENGE or PATH_RESPONSE should be sent on the path.
-    pub(super) fn need_send_validation_frames(&self) -> bool {
+    pub(super) fn need_send_validation_frames(&self, is_server: bool) -> bool {
+        if is_server && self.anti_ampl_limit < MIN_PATH_PROBE_SIZE {
+            return false;
+        }
+
         self.need_send_challenge || !self.recv_chals.is_empty()
+    }
+
+    /// Whether the datagrams sent on the unvalidated path should be expanded
+    /// to least the maximum datagram size
+    pub(super) fn need_expand_padding_frames(&self, is_server: bool) -> bool {
+        if self.validated() {
+            return false;
+        }
+        if is_server && self.anti_ampl_limit <= self.recovery.max_datagram_size {
+            return false;
+        }
+        true
     }
 
     /// Promote the path to the provided state.
@@ -300,14 +329,26 @@ impl Path {
         !self.active && self.dcid_seq.is_none()
     }
 
-    /// Return statistics about the path
-    pub fn stats(&self) -> &PathStats {
-        &self.stats
+    /// Update and return the latest statistics about the path
+    pub fn stats(&mut self) -> &PathStats {
+        self.recovery.stat_lazy_update();
+        &self.recovery.stats
     }
 
     /// Return the validation state of the path
     pub fn state(&self) -> PathState {
         self.state
+    }
+
+    /// Return true if the given address is a pure IPv6 address, rather than an
+    /// IPv4-mapped IPv6 address.
+    fn is_ipv6(addr: &SocketAddr) -> bool {
+        if let IpAddr::V6(ip) = addr.ip() {
+            if !matches!(ip.segments(), [0, 0, 0, 0, 0, 0xffff, _, _]) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -319,26 +360,23 @@ impl std::fmt::Debug for Path {
     }
 }
 
-/// Statistics about a path.
-#[derive(Debug, Default)]
-pub struct PathStats {
-    /// The number of QUIC packets received.
-    pub recv_count: usize,
+/// The states about the path validation.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PathState {
+    /// The path validation failed
+    Failed,
 
-    /// The number of QUIC packets sent.
-    pub sent_count: usize,
+    /// No path validation has been performed.
+    Unknown,
 
-    /// The number of QUIC packets lost.
-    pub lost_count: usize,
+    /// The path is under validation.
+    Validating,
 
-    /// The number of received bytes.
-    pub recv_bytes: u64,
+    /// The remote address has been validated, but not the path MTU.
+    ValidatingMTU,
 
-    /// The number of sent bytes.
-    pub sent_bytes: u64,
-
-    /// The number of lost bytes.
-    pub lost_bytes: u64,
+    /// The path has been validated.
+    Validated,
 }
 
 /// Path manager for a QUIC connection
@@ -354,6 +392,9 @@ pub(crate) struct PathMap {
     /// `Path` identifier.
     addrs: BTreeMap<(SocketAddr, SocketAddr), usize>,
 
+    /// The anti-amplification factor.
+    pub(crate) anti_ampl_factor: usize,
+
     /// Whether the multipath extension is successfully negotiated.
     is_multipath: bool,
 
@@ -362,7 +403,12 @@ pub(crate) struct PathMap {
 }
 
 impl PathMap {
-    pub fn new(mut initial_path: Path, max_paths: usize, is_server: bool) -> Self {
+    pub fn new(
+        mut initial_path: Path,
+        max_paths: usize,
+        anti_ampl_factor: usize,
+        is_server: bool,
+    ) -> Self {
         // As it is the first path, it is active by default.
         initial_path.active = true;
         let local_addr = initial_path.local_addr;
@@ -382,6 +428,7 @@ impl PathMap {
             paths,
             max_paths,
             addrs,
+            anti_ampl_factor,
             is_multipath: false,
             is_server,
         }
@@ -451,7 +498,7 @@ impl PathMap {
         Ok(pid)
     }
 
-    /// Return a immutable iterator over all existing paths.
+    /// Return an immutable iterator over all existing paths.
     pub fn iter(&self) -> slab::Iter<Path> {
         self.paths.iter()
     }
@@ -474,10 +521,11 @@ impl PathMap {
     }
 
     /// Process a PATH_RESPONSE frame on the give path
-    pub fn on_path_resp_received(&mut self, path_id: usize, data: [u8; 8]) {
+    pub fn on_path_resp_received(&mut self, path_id: usize, data: [u8; 8]) -> bool {
         if let Some(path) = self.paths.get_mut(path_id) {
-            path.on_path_resp_received(data, self.is_multipath);
+            return path.on_path_resp_received(data, self.is_multipath);
         }
+        false
     }
 
     /// Handle the sent event of PATH_CHALLENGE.
@@ -509,13 +557,93 @@ impl PathMap {
             .min()
     }
 
+    /// Return the lowest pacer timer value among all paths.
+    pub fn min_pacer_timer(&self) -> Option<time::Instant> {
+        self.paths
+            .iter()
+            .filter_map(|(_, p)| p.recovery.pacer_timer)
+            .min()
+    }
+
     /// Return the minimum timeout among all paths.
     pub fn min_path_chal_timer(&self) -> Option<time::Instant> {
         self.paths
             .iter()
             .filter_map(|(_, p)| p.sent_chals.front())
-            .min_by_key(|&(_, _, loss_time)| loss_time)
-            .map(|&(_, _, loss_time)| loss_time)
+            .min_by_key(|&(_, _, _, loss_time)| loss_time)
+            .map(|&(_, _, _, loss_time)| loss_time)
+    }
+
+    /// Return the maximum PTO among all paths.
+    pub fn max_pto(&self) -> Option<Duration> {
+        self.iter()
+            .map(|(_, path)| path.recovery.rtt.pto_base())
+            .max()
+    }
+
+    /// Increase send limit before address validation for server
+    pub fn inc_anti_ampl_limit(&mut self, pid: usize, pkt_len: usize) {
+        if !self.is_server {
+            return;
+        }
+        if let Some(path) = self.paths.get_mut(pid) {
+            if !path.verified_peer_address {
+                let inc = self.anti_ampl_factor.saturating_mul(pkt_len);
+                path.anti_ampl_limit = path.anti_ampl_limit.saturating_add(inc);
+            }
+        }
+    }
+
+    /// Decrease send limit before address validation for server
+    pub fn dec_anti_ampl_limit(&mut self, pid: usize, pkt_len: usize) {
+        if !self.is_server {
+            return;
+        }
+        if let Some(path) = self.paths.get_mut(pid) {
+            if !path.verified_peer_address {
+                path.anti_ampl_limit = path.anti_ampl_limit.saturating_sub(pkt_len);
+            }
+        }
+    }
+
+    /// Return the min value between the given `left` and `anti_ampl_limit`
+    pub fn cmp_anti_ampl_limit(&self, pid: usize, left: usize) -> usize {
+        if !self.is_server {
+            return left;
+        }
+        if let Some(path) = self.paths.get(pid) {
+            if !path.verified_peer_address {
+                return cmp::min(left, path.anti_ampl_limit);
+            }
+        }
+        left
+    }
+
+    /// Schedule a Ping frame on the specified path or all active paths.
+    pub fn mark_ping(&mut self, path_addr: Option<FourTuple>) -> Result<()> {
+        // If multipath is not enabled, schedule a Ping frame on the current
+        // active path.
+        if !self.is_multipath {
+            self.get_active_mut()?.need_send_ping = true;
+            return Ok(());
+        }
+
+        // If multipath is enabled, schedule a Ping frame on the specified path
+        // or all the active paths.
+        if let Some(a) = path_addr {
+            let pid = match self.get_path_id(&(a.local, a.remote)) {
+                Some(pid) => pid,
+                None => return Ok(()),
+            };
+            self.get_mut(pid)?.need_send_ping = true;
+            return Ok(());
+        }
+        for (_, path) in self.paths.iter_mut() {
+            if path.active() {
+                path.need_send_ping = true;
+            }
+        }
+        Ok(())
     }
 
     /// Promote to multipath mode.
@@ -542,6 +670,7 @@ mod tests {
             initial_rtt: crate::INITIAL_RTT,
             pto_linear_factor: crate::DEFAULT_PTO_LINEAR_FACTOR,
             max_pto: crate::MAX_PTO,
+            ..RecoveryConfig::default()
         }
     }
 
@@ -555,7 +684,12 @@ mod tests {
 
         let conf = new_test_recovery_config();
         let initial_path = Path::new(clients[0], server, true, &conf, "");
-        let mut path_mgr = PathMap::new(initial_path, path_num, is_server);
+        let mut path_mgr = PathMap::new(
+            initial_path,
+            path_num,
+            crate::ANTI_AMPLIFICATION_FACTOR,
+            is_server,
+        );
         for i in 1..clients.len() {
             let new_path = Path::new(clients[i], server, false, &conf, "");
             path_mgr.insert_path(new_path)?;
@@ -584,8 +718,8 @@ mod tests {
         assert_eq!(path_mgr.get(pid)?.remote_addr(), server_addr);
         assert_eq!(path_mgr.get(pid)?.active(), true);
         assert_eq!(path_mgr.get(pid)?.unused(), false);
-        assert_eq!(path_mgr.get(pid)?.stats().recv_count, 0);
-        assert_eq!(path_mgr.get(pid)?.stats().sent_count, 0);
+        assert_eq!(path_mgr.get_mut(pid)?.stats().recv_count, 0);
+        assert_eq!(path_mgr.get_mut(pid)?.stats().sent_count, 0);
         assert_eq!(path_mgr.get_active()?.local_addr(), client_addr);
         assert_eq!(path_mgr.get_active_mut()?.remote_addr(), server_addr);
         assert_eq!(path_mgr.get_active_path_id()?, 0);
@@ -599,7 +733,7 @@ mod tests {
         let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
         let conf = new_test_recovery_config();
         let initial_path = Path::new(client_addr, server_addr, true, &conf, "");
-        let mut path_mgr = PathMap::new(initial_path, 8, false);
+        let mut path_mgr = PathMap::new(initial_path, 8, crate::ANTI_AMPLIFICATION_FACTOR, false);
 
         // Add a new path and initiate path validation
         let client_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
@@ -611,7 +745,7 @@ mod tests {
             .get_path_id(&(client_addr1, server_addr))
             .ok_or(Error::InternalError)?;
         path_mgr.get_mut(pid)?.initiate_path_chal();
-        assert!(path_mgr.get_mut(pid)?.need_send_validation_frames());
+        assert!(path_mgr.get_mut(pid)?.need_send_validation_frames(false));
         assert_eq!(path_mgr.get_mut(pid)?.path_chal_initiated(), true);
 
         // Fake sending of PATH_CHALLENGE
@@ -623,11 +757,11 @@ mod tests {
         assert_eq!(path_mgr.get_mut(pid)?.state, PathState::Validating);
 
         // Fake receiving of unmatched PATH_RESPONSE
-        path_mgr.on_path_resp_received(pid, [0xab; 8]);
+        assert_eq!(path_mgr.on_path_resp_received(pid, [0xab; 8]), false);
         assert_eq!(path_mgr.get_mut(pid)?.state, PathState::ValidatingMTU);
 
         // Fake receiving of PATH_RESPONSE
-        path_mgr.on_path_resp_received(pid, data);
+        assert_eq!(path_mgr.on_path_resp_received(pid, data), false);
         assert_eq!(path_mgr.get_mut(pid)?.path_chal_initiated(), true);
         assert_eq!(path_mgr.get_mut(pid)?.validated(), false);
         assert_eq!(path_mgr.get_mut(pid)?.state, PathState::ValidatingMTU);
@@ -636,14 +770,14 @@ mod tests {
         path_mgr.on_path_chal_sent(pid, data, 1300, now)?;
 
         // Fake receiving of PATH_RESPONSE
-        path_mgr.on_path_resp_received(pid, data);
+        assert_eq!(path_mgr.on_path_resp_received(pid, data), true);
         assert_eq!(path_mgr.get_mut(pid)?.path_chal_initiated(), false);
         assert_eq!(path_mgr.get_mut(pid)?.validated(), true);
         assert_eq!(path_mgr.get_mut(pid)?.state, PathState::Validated);
         assert_eq!(path_mgr.get_mut(pid)?.sent_chals.len(), 0);
 
         // Fake receiving of depulicated PATH_RESPONSE
-        path_mgr.on_path_resp_received(pid, data);
+        assert_eq!(path_mgr.on_path_resp_received(pid, data), false);
         assert_eq!(path_mgr.get_mut(pid)?.validated(), true);
 
         // Timeout event
@@ -661,7 +795,7 @@ mod tests {
         let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
         let conf = new_test_recovery_config();
         let initial_path = Path::new(server_addr, client_addr, true, &conf, "");
-        let mut path_mgr = PathMap::new(initial_path, 2, false);
+        let mut path_mgr = PathMap::new(initial_path, 2, crate::ANTI_AMPLIFICATION_FACTOR, false);
 
         // Fake receiving of an packet on a new path 1
         let client_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
@@ -712,7 +846,7 @@ mod tests {
             .get_path_id(&(clients[1], server_addr))
             .ok_or(Error::InternalError)?;
         path_mgr.get_mut(pid)?.initiate_path_chal();
-        assert!(path_mgr.get_mut(pid)?.need_send_validation_frames());
+        assert!(path_mgr.get_mut(pid)?.need_send_validation_frames(false));
         assert_eq!(path_mgr.get_mut(pid)?.path_chal_initiated(), true);
 
         // Fake sending of PATH_CHALLENGE.
@@ -792,6 +926,31 @@ mod tests {
         // Fake receiving of PATH_RESPONSE on the first path.
         path_mgr.on_path_resp_received(pid1, data);
         assert_eq!(path_mgr.min_path_chal_timer(), Some(timeout2));
+
+        Ok(())
+    }
+
+    #[test]
+    fn path_chals_flood() -> Result<()> {
+        let client_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9443);
+        let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 443);
+        let conf = new_test_recovery_config();
+        let initial_path = Path::new(server_addr, client_addr, true, &conf, "");
+        let mut path_mgr = PathMap::new(initial_path, 2, crate::ANTI_AMPLIFICATION_FACTOR, false);
+
+        // Fake receiving of a packet on a new path
+        let client_addr1 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 9444);
+        let new_path = Path::new(server_addr, client_addr1, false, &conf, "");
+        let pid = path_mgr.insert_path(new_path)?;
+        assert_eq!(path_mgr.len(), 2);
+        assert_eq!(pid, 1);
+
+        // Fake receiving of PATH_CHALLENGE
+        for i in 0..1000 {
+            let data = rand::random::<[u8; 8]>();
+            path_mgr.on_path_chal_received(pid, data);
+            assert!(path_mgr.get_mut(pid)?.recv_chals.len() <= MAX_PATH_CHALS_RECV);
+        }
 
         Ok(())
     }

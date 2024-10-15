@@ -30,17 +30,21 @@ pub use bbr3::Bbr3;
 pub use bbr3::Bbr3Config;
 pub use copa::Copa;
 pub use copa::CopaConfig;
+pub use copa::COPA_DELTA;
 pub use cubic::Cubic;
 pub use cubic::CubicConfig;
+pub use dummy::Dummy;
+pub use dummy::DummyConfig;
 pub use hystart_plus_plus::HystartPlusPlus;
+pub use pacing::Pacer;
 
-/// Available congestion control algorithm
+/// Available congestion control algorithms.
 #[repr(C)]
 #[derive(Eq, PartialEq, Debug, Clone, Copy, Default)]
 pub enum CongestionControlAlgorithm {
     /// CUBIC uses a cubic function instead of a linear window increase function
     /// of the current TCP standards to improve scalability and stability under
-    /// fast and long-distance networks..
+    /// fast and long-distance networks.
     Cubic,
 
     /// BBR uses recent measurements of a transport connection's delivery rate,
@@ -61,6 +65,10 @@ pub enum CongestionControlAlgorithm {
     /// and delay can be configured via a user-specified parameter.
     /// (Experimental)
     Copa,
+
+    /// Dummy is a simple congestion controller with a static congestion window.
+    /// It is intended to be used for testing and experiments.
+    Dummy,
 }
 
 impl FromStr for CongestionControlAlgorithm {
@@ -75,6 +83,8 @@ impl FromStr for CongestionControlAlgorithm {
             Ok(CongestionControlAlgorithm::Bbr3)
         } else if algor.eq_ignore_ascii_case("copa") {
             Ok(CongestionControlAlgorithm::Copa)
+        } else if algor.eq_ignore_ascii_case("dummy") {
+            Ok(CongestionControlAlgorithm::Dummy)
         } else {
             Err(Error::InvalidConfig("unknown".into()))
         }
@@ -177,37 +187,12 @@ impl fmt::Debug for dyn CongestionController {
 
 /// Build a congestion controller.
 pub fn build_congestion_controller(conf: &RecoveryConfig) -> Box<dyn CongestionController> {
-    let max_datagram_size: u64 = conf.max_datagram_size as u64;
-    let min_cwnd = conf.min_congestion_window.saturating_mul(max_datagram_size);
-    let initial_cwnd = conf
-        .initial_congestion_window
-        .saturating_mul(max_datagram_size);
-
     match conf.congestion_control_algorithm {
-        CongestionControlAlgorithm::Cubic => Box::new(Cubic::new(CubicConfig::new(
-            min_cwnd,
-            initial_cwnd,
-            Some(conf.initial_rtt),
-            max_datagram_size,
-        ))),
-        CongestionControlAlgorithm::Bbr => Box::new(Bbr::new(BbrConfig::new(
-            min_cwnd,
-            initial_cwnd,
-            Some(conf.initial_rtt),
-            max_datagram_size,
-        ))),
-        CongestionControlAlgorithm::Bbr3 => Box::new(Bbr3::new(Bbr3Config::new(
-            min_cwnd,
-            initial_cwnd,
-            Some(conf.initial_rtt),
-            max_datagram_size,
-        ))),
-        CongestionControlAlgorithm::Copa => Box::new(Copa::new(CopaConfig::new(
-            min_cwnd,
-            initial_cwnd,
-            Some(conf.initial_rtt),
-            max_datagram_size,
-        ))),
+        CongestionControlAlgorithm::Cubic => Box::new(Cubic::new(CubicConfig::from(conf))),
+        CongestionControlAlgorithm::Bbr => Box::new(Bbr::new(BbrConfig::from(conf))),
+        CongestionControlAlgorithm::Bbr3 => Box::new(Bbr3::new(Bbr3Config::from(conf))),
+        CongestionControlAlgorithm::Copa => Box::new(Copa::new(CopaConfig::from(conf))),
+        CongestionControlAlgorithm::Dummy => Box::new(Dummy::new(DummyConfig::from(conf))),
     }
 }
 
@@ -235,6 +220,9 @@ mod tests {
             ("copa", Ok(CongestionControlAlgorithm::Copa)),
             ("Copa", Ok(CongestionControlAlgorithm::Copa)),
             ("COPA", Ok(CongestionControlAlgorithm::Copa)),
+            ("dummy", Ok(CongestionControlAlgorithm::Dummy)),
+            ("Dummy", Ok(CongestionControlAlgorithm::Dummy)),
+            ("DUMMY", Ok(CongestionControlAlgorithm::Dummy)),
             ("cubci", Err(Error::InvalidConfig("unknown".into()))),
         ];
 
@@ -287,6 +275,7 @@ mod bbr3;
 mod copa;
 mod cubic;
 mod delivery_rate;
+mod dummy;
 mod hystart_plus_plus;
 mod minmax;
 mod pacing;

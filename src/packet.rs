@@ -180,7 +180,7 @@ impl PacketHeader {
     ///
     /// The Length/Packet Number field are intentionally not written to the
     /// buffer for the moment.
-    /// See RFC 9002 Section 17 Packet Formats
+    /// See RFC 9000 Section 17 Packet Formats
     pub fn to_bytes(&self, mut buf: &mut [u8]) -> Result<usize> {
         let len = buf.len();
 
@@ -267,7 +267,7 @@ impl PacketHeader {
     /// The Length/Packet Number field in packet header are intentionally not
     /// read from the buffer for the moment.
     ///
-    /// See RFC 9002 Section 17 Packet Formats
+    /// See RFC 9000 Section 17 Packet Formats
     pub fn from_bytes(mut buf: &[u8], dcid_len: usize) -> Result<(PacketHeader, usize)> {
         let len = buf.len();
         let first = buf.read_u8()?;
@@ -349,6 +349,29 @@ impl PacketHeader {
             },
             len - buf.len(),
         ))
+    }
+
+    /// Extract the header form, version and destination connection id.
+    ///
+    /// Return (true, version, cid) for the quic packet with a long header
+    /// Return (false, 0, cid) for the quic packet with a short header
+    /// See RFC 8999 Section 5
+    pub fn header_info(mut buf: &[u8], dcid_len: usize) -> Result<(bool, u32, ConnectionId)> {
+        let first = buf.read_u8()?;
+
+        // Decode in short header form for 1-RTT.
+        if !PacketHeader::long_header(first) {
+            let dcid = buf.read(dcid_len)?;
+            let dcid = ConnectionId::new(&dcid);
+            return Ok((false, 0, dcid));
+        }
+
+        // Decode in long header form.
+        let version = buf.read_u32()?;
+        let dcid_len = buf.read_u8()?;
+        let dcid = buf.read(dcid_len as usize)?;
+        let dcid = ConnectionId::new(&dcid);
+        Ok((true, version, dcid))
     }
 
     /// Return true if the packet has a long header.
@@ -472,6 +495,7 @@ fn encrypt_header(
 /// The `paylaod_offset` is the offset of packet payload in `pkt_buf`.
 /// The `payload_len` is the length of pacekt payload (other than the value of Length field).
 /// The `pkt_num` is the decrypted and decoded packet number.
+#[allow(unexpected_cfgs)]
 pub(crate) fn decrypt_payload(
     pkt_buf: &mut [u8],
     payload_offset: usize,
@@ -509,11 +533,13 @@ pub(crate) fn decrypt_payload(
 /// The `pkt_buf` is the raw data of a QUIC packet.
 /// The `pkt_num_offset` is the offset of Packet Number field in `pkt_buf`.
 /// The `hdr` is the partially parsed header return by PacketHeader::from().
+/// The `plaintext_mode` is used for the `disable_1rtt_encryption` extension.
 pub(crate) fn decrypt_header(
     pkt_buf: &mut [u8],
     pkt_num_offset: usize,
     hdr: &mut PacketHeader,
     aead: &Open,
+    plaintext_mode: bool,
 ) -> Result<()> {
     if pkt_buf.len() < pkt_num_offset + MAX_PKT_NUM_LEN + SAMPLE_LEN {
         return Err(Error::BufferTooShort);
@@ -522,20 +548,25 @@ pub(crate) fn decrypt_header(
     let mut first = pkt_buf[0];
     let sample_start = pkt_num_offset + MAX_PKT_NUM_LEN;
     let sample = &pkt_buf[sample_start..sample_start + SAMPLE_LEN];
+    let mask = aead.new_mask(sample)?;
 
     // Remove protection of bits in the first byte
-    let mask = aead.new_mask(sample)?;
-    if PacketHeader::long_header(first) {
-        first ^= mask[0] & 0x0f;
-    } else {
-        first ^= mask[0] & 0x1f;
+    if !plaintext_mode {
+        if PacketHeader::long_header(first) {
+            first ^= mask[0] & 0x0f;
+        } else {
+            first ^= mask[0] & 0x1f;
+        }
     }
 
-    // Remove protection of packet number field
     let pkt_num_len = usize::from((first & PKT_NUM_LEN_MASK) + 1);
     let pkt_num_buf = &mut pkt_buf[pkt_num_offset..pkt_num_offset + pkt_num_len];
-    for i in 0..pkt_num_len {
-        pkt_num_buf[i] ^= mask[i + 1];
+
+    // Remove protection of packet number field
+    if !plaintext_mode {
+        for i in 0..pkt_num_len {
+            pkt_num_buf[i] ^= mask[i + 1];
+        }
     }
 
     // Extract packet number corresponding to the length.
@@ -594,9 +625,18 @@ pub(crate) fn decode_packet_num(largest_pn: u64, truncated_pn: u64, pkt_num_len:
     candidate_pn
 }
 
-/// Encode the truncated packet number.
-pub(crate) fn encode_packet_num(pkt_num: u64, mut buf: &mut [u8]) -> Result<usize> {
-    let len = packet_num_len(pkt_num)?;
+/// Encode the full packet number.
+///
+/// Packet numbers are encoded in 1 to 4 bytes. The number of bits required to
+/// represent the packet number is reduced by including only the least
+/// significant bits of the packet number.
+///
+/// The `pkt_num` is the full packet number of the packet being sent.
+/// The `len` is the length of encoded packet number.
+/// See RFC 9000 Section A.2 Sample Packet Number Encoding Algorithm
+pub(crate) fn encode_packet_num(pkt_num: u64, len: usize, mut buf: &mut [u8]) -> Result<usize> {
+    // Encode the integer value and truncate to the num_bytes least significant
+    // bytes.
     match len {
         1 => buf.write_u8(pkt_num as u8)?,
         2 => buf.write_u16(pkt_num as u16)?,
@@ -610,23 +650,22 @@ pub(crate) fn encode_packet_num(pkt_num: u64, mut buf: &mut [u8]) -> Result<usiz
 
 /// Return the length of encoded packet number.
 ///
-/// Packet numbers are encoded in 1 to 4 bytes. The number of bits required to
-/// represent the packet number is reduced by including only the least
-/// significant bits of the packet number.
-/// See RFC 9000 Section 17.1
-pub(crate) fn packet_num_len(pkt_num: u64) -> Result<usize> {
-    let len = if pkt_num < u64::from(u8::MAX) {
-        1
-    } else if pkt_num < u64::from(u16::MAX) {
-        2
-    } else if pkt_num < 16_777_215u64 {
-        3
-    } else if pkt_num < u64::from(u32::MAX) {
-        4
+/// The `pkt_num` is the full packet number of the packet being sent.
+/// The `largest_acked` is the largest packet number that has been acknowledged
+/// by the peer in the current packet number space, if any.
+/// See RFC 9000 Section A.2 Sample Packet Number Encoding Algorithm
+pub(crate) fn packet_num_len(pkt_num: u64, largest_acked: Option<u64>) -> usize {
+    // The number of bits must be at least one more than the base-2 logarithm
+    // of the number of contiguous unacknowledged packet numbers, including the
+    // new packet
+    let num_unacked = if let Some(largest_acked) = largest_acked {
+        pkt_num.saturating_sub(largest_acked)
     } else {
-        return Err(Error::InvalidPacket);
+        pkt_num.saturating_add(1)
     };
-    Ok(len)
+
+    let min_bits = u64::BITS - num_unacked.leading_zeros(); // log(num_unacked, 2) + 1
+    ((min_bits + 7) / 8) as usize // ceil(min_bits / 8)
 }
 
 /// Encode a Version Negotiation packet to the given buffer
@@ -824,7 +863,13 @@ mod tests {
             token=040404040404040404040404040404040404040404040404"
         );
         let len = initial_hdr.to_bytes(&mut buf)?;
-        assert_eq!((initial_hdr, len), PacketHeader::from_bytes(&mut buf, 20)?);
+        assert_eq!(
+            (initial_hdr.clone(), len),
+            PacketHeader::from_bytes(&mut buf, 20)?
+        );
+
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (true, initial_hdr.version, initial_hdr.dcid));
         Ok(())
     }
 
@@ -855,7 +900,13 @@ mod tests {
 
         let mut buf = [0; 128];
         let len = hsk_hdr.to_bytes(&mut buf)?;
-        assert_eq!((hsk_hdr, len), PacketHeader::from_bytes(&mut buf, 20)?);
+        assert_eq!(
+            (hsk_hdr.clone(), len),
+            PacketHeader::from_bytes(&mut buf, 20)?
+        );
+
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (true, hsk_hdr.version, hsk_hdr.dcid));
         Ok(())
     }
 
@@ -886,7 +937,13 @@ mod tests {
 
         let mut buf = [0; 128];
         let len = zero_rtt_hdr.to_bytes(&mut buf)?;
-        assert_eq!((zero_rtt_hdr, len), PacketHeader::from_bytes(&mut buf, 20)?);
+        assert_eq!(
+            (zero_rtt_hdr.clone(), len),
+            PacketHeader::from_bytes(&mut buf, 20)?
+        );
+
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (true, zero_rtt_hdr.version, zero_rtt_hdr.dcid));
         Ok(())
     }
 
@@ -930,6 +987,8 @@ mod tests {
         // Note: key phase is encrypted and not parsed by from_bytes()
         assert_eq!(PacketHeader::from_bytes(&mut buf, 20)?.0.key_phase, false);
 
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (false, one_rtt_hdr.version, one_rtt_hdr.dcid));
         Ok(())
     }
 
@@ -959,6 +1018,9 @@ mod tests {
             dcid=0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d \
             scid=0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c"
         );
+
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (true, hdr.version, hdr.dcid));
 
         let mut br = &buf[hdr_len..];
         let ver = br.read_u32()?;
@@ -1012,6 +1074,9 @@ mod tests {
             scid=0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c \
             token=71756963c0a8010a0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e"
         );
+
+        let info = PacketHeader::header_info(&mut buf, 20)?;
+        assert_eq!(info, (true, hdr.version, hdr.dcid));
 
         verify_retry_integrity_tag(&mut buf[..len], &odcid, crate::QUIC_VERSION_V1)?;
         Ok(())
@@ -1088,21 +1153,40 @@ mod tests {
     #[test]
     fn packet_num() -> Result<()> {
         let test_cases = [
-            (0, Ok(1)),
-            (254, Ok(1)),
-            (255, Ok(2)),
-            (65534, Ok(2)),
-            (65535, Ok(3)),
-            (16777214, Ok(3)),
-            (16777215, Ok(4)),
+            (0, None, 1),
+            (254, Some(0), 1),
+            (255, Some(0), 1),
+            (256, Some(0), 2),
+            (65534, Some(0), 2),
+            (65535, Some(0), 2),
+            (65536, Some(0), 3),
+            (16777214, Some(0), 3),
+            (16777215, Some(0), 3),
+            (16777216, Some(0), 4),
+            (4294967295, Some(0), 4),
+            (4294967296, Some(1), 4),
+            (4294967296, Some(4294967295), 1),
+            (4611686018427387903, Some(4611686018427387902), 1),
         ];
-
         let mut buf = [0; 4];
         for case in test_cases {
             let pkt_num = case.0;
-            let len = encode_packet_num(pkt_num, &mut buf[..]);
-            assert_eq!(len, case.1);
+            let largest_acked = case.1;
+            let pkt_num_len = packet_num_len(pkt_num, largest_acked);
+            assert_eq!(pkt_num_len, case.2);
+
+            let len = encode_packet_num(pkt_num, pkt_num_len, &mut buf[..])?;
+            assert_eq!(len, pkt_num_len);
         }
+
+        // Test case in A.2. Sample Packet Number Encoding Algorithm
+        let pkt_num_len = packet_num_len(0xac5c02, Some(0xabe8b3));
+        assert_eq!(pkt_num_len, 2);
+
+        // Test case in RFC 9000 A.3. Sample Packet Number Decoding Algorithm
+        let pkt_num = decode_packet_num(0xa82f30ea, 0x9b32, 2);
+        assert_eq!(pkt_num, 0xa82f9b32);
+
         Ok(())
     }
 
@@ -1262,7 +1346,7 @@ mod tests {
 
         // Decrypt QUIC packet header on the server
         let (open, _) = tls::derive_initial_secrets(&hdr.dcid, hdr.version, true)?;
-        decrypt_header(&mut pkt[..], pkt_num_off, &mut hdr, &open)?;
+        decrypt_header(&mut pkt[..], pkt_num_off, &mut hdr, &open, false)?;
         assert_eq!(hdr.pkt_num_len, 4);
 
         hdr.pkt_num = decode_packet_num(0, hdr.pkt_num, hdr.pkt_num_len);
@@ -1329,7 +1413,7 @@ mod tests {
 
         // Decrypt QUIC packet header on the client
         let (open, _) = tls::derive_initial_secrets(&odcid, hdr.version, false)?;
-        decrypt_header(&mut pkt[..], pkt_num_off, &mut hdr, &open)?;
+        decrypt_header(&mut pkt[..], pkt_num_off, &mut hdr, &open, false)?;
         assert_eq!(hdr.pkt_num_len, 2);
 
         hdr.pkt_num = decode_packet_num(0, hdr.pkt_num, hdr.pkt_num_len);
@@ -1378,7 +1462,7 @@ mod tests {
         b.write(&pkt_hdr_data)?;
         b.write(&pkt_payload)?;
 
-        let aead = Seal::new_with_secret(tls::Algorithm::ChaCha20Poly1305, &secret)?;
+        let aead = Seal::new_with_secret(tls::Algorithm::ChaCha20Poly1305, secret.to_vec())?;
         let written = encrypt_packet(
             out.as_mut_slice(),
             None,
@@ -1403,23 +1487,23 @@ mod tests {
             dcid: ConnectionId::random(),
             scid: ConnectionId::default(),
             pkt_num: 10,
-            pkt_num_len: packet_num_len(10)?,
+            pkt_num_len: packet_num_len(10, Some(1)),
             token: None,
             key_phase: false,
         };
         let pkt_payload = [01, 02, 03, 04];
         let cid_seq = Some(2);
-        let mut secret = [0u8, 32];
+        let mut secret = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut secret);
 
         // encode the packet header and payload
         let mut written = pkt_hdr.to_bytes(&mut out)?;
-        written += encode_packet_num(pkt_hdr.pkt_num, &mut out[written..])?;
+        written += encode_packet_num(pkt_hdr.pkt_num, 1, &mut out[written..])?;
         let (payload_off, payload_end) = (written, written + pkt_payload.len());
         out[payload_off..payload_end].copy_from_slice(&pkt_payload);
 
         // encrypt the packet header and payload
-        let seal = Seal::new_with_secret(tls::Algorithm::ChaCha20Poly1305, &secret)?;
+        let seal = Seal::new_with_secret(tls::Algorithm::ChaCha20Poly1305, secret.to_vec())?;
         let written = encrypt_packet(
             out.as_mut_slice(),
             cid_seq,
@@ -1438,8 +1522,8 @@ mod tests {
         assert_eq!(hdr.dcid, pkt_hdr.dcid);
         assert_eq!(hdr.key_phase, pkt_hdr.key_phase);
 
-        let open = Open::new_with_secret(tls::Algorithm::ChaCha20Poly1305, &secret)?;
-        decrypt_header(&mut out, read, &mut hdr, &open)?;
+        let open = Open::new_with_secret(tls::Algorithm::ChaCha20Poly1305, secret.to_vec())?;
+        decrypt_header(&mut out, read, &mut hdr, &open, false)?;
         assert_eq!(hdr.pkt_num_len, pkt_hdr.pkt_num_len);
         assert_eq!(hdr.pkt_num, pkt_hdr.pkt_num);
 
@@ -1480,7 +1564,7 @@ mod tests {
             key_phase: false,
         };
         assert_eq!(
-            decrypt_header(bw, 10, &mut hdr, &open),
+            decrypt_header(bw, 10, &mut hdr, &open, false),
             Err(Error::BufferTooShort)
         );
         assert_eq!(

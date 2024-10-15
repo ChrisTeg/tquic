@@ -14,7 +14,6 @@
 
 use std::collections::hash_map;
 use std::collections::VecDeque;
-#[cfg(feature = "sfv")]
 use std::convert::TryFrom;
 use std::mem::MaybeUninit;
 use std::sync::Arc;
@@ -2106,8 +2105,6 @@ impl Http3Priority {
     }
 }
 
-#[cfg(feature = "sfv")]
-#[cfg_attr(docsrs, doc(cfg(feature = "sfv")))]
 impl TryFrom<&[u8]> for Http3Priority {
     type Error = crate::h3::Http3Error;
 
@@ -2216,6 +2213,7 @@ mod tests {
             conf.set_max_connection_window(1024 * 1024 * 3);
             conf.set_max_stream_window(1024 * 1024 * 1);
             conf.set_max_concurrent_conns(100);
+            conf.enable_pacing(false);
 
             let application_protos = vec![b"h3".to_vec()];
             let tls_config = if !is_server {
@@ -3312,6 +3310,9 @@ mod tests {
             assert_eq!(s.server_poll(), Ok((stream_id, headers_event)));
             assert_eq!(s.server_poll(), Ok((stream_id, Http3Event::Finished)));
             assert_eq!(s.server_poll(), Err(Http3Error::Done));
+
+            // Server send MAX_DATA
+            s.move_forward().unwrap();
         }
 
         // 4. Server send response headers with FIN for stream 0, 4, 8.
@@ -4414,17 +4415,14 @@ mod tests {
 
         assert_eq!(s.server_poll(), Ok((stream_id, Http3Event::PriorityUpdate)));
 
-        #[cfg(feature = "sfv")]
-        {
-            let priority_value = s.server.take_priority_update(stream_id).unwrap();
-            assert_eq!(
-                Http3Priority::try_from(priority_value.as_slice()),
-                Ok(Http3Priority {
-                    urgency: 3,
-                    incremental: false
-                })
-            );
-        }
+        let priority_value = s.server.take_priority_update(stream_id).unwrap();
+        assert_eq!(
+            Http3Priority::try_from(priority_value.as_slice()),
+            Ok(Http3Priority {
+                urgency: 3,
+                incremental: false
+            })
+        );
 
         // Subcase3: Client send priority update for request stream, incremental.
         s.client
@@ -4442,17 +4440,14 @@ mod tests {
 
         assert_eq!(s.server_poll(), Ok((stream_id, Http3Event::PriorityUpdate)));
 
-        #[cfg(feature = "sfv")]
-        {
-            let priority_value = s.server.take_priority_update(stream_id).unwrap();
-            assert_eq!(
-                Http3Priority::try_from(priority_value.as_slice()),
-                Ok(Http3Priority {
-                    urgency: 3,
-                    incremental: true
-                })
-            );
-        }
+        let priority_value = s.server.take_priority_update(stream_id).unwrap();
+        assert_eq!(
+            Http3Priority::try_from(priority_value.as_slice()),
+            Ok(Http3Priority {
+                urgency: 3,
+                incremental: true
+            })
+        );
 
         assert_eq!(s.server_poll(), Err(Http3Error::Done));
     }
@@ -4480,17 +4475,14 @@ mod tests {
         // 2. Server receive priority update.
         assert_eq!(s.server_poll(), Ok((stream_id, Http3Event::PriorityUpdate)));
 
-        #[cfg(feature = "sfv")]
-        {
-            let priority_value = s.server.take_priority_update(stream_id).unwrap();
-            assert_eq!(
-                Http3Priority::try_from(priority_value.as_slice()),
-                Ok(Http3Priority {
-                    urgency: 3,
-                    incremental: false
-                })
-            );
-        }
+        let priority_value = s.server.take_priority_update(stream_id).unwrap();
+        assert_eq!(
+            Http3Priority::try_from(priority_value.as_slice()),
+            Ok(Http3Priority {
+                urgency: 3,
+                incremental: false
+            })
+        );
 
         // Stream's priority is not initialized, the underlying quic stream is not opened, in server side.
         let stream = s.server.streams.get(&stream_id).unwrap();
@@ -4576,17 +4568,14 @@ mod tests {
         assert_eq!(s.server_poll(), Ok((stream_id, Http3Event::PriorityUpdate)));
         assert_eq!(s.server_poll(), Err(Http3Error::Done));
 
-        #[cfg(feature = "sfv")]
-        {
-            let priority_value = s.server.take_priority_update(stream_id).unwrap();
-            assert_eq!(
-                Http3Priority::try_from(priority_value.as_slice()),
-                Ok(Http3Priority {
-                    urgency: 5,
-                    incremental: false
-                })
-            );
-        }
+        let priority_value = s.server.take_priority_update(stream_id).unwrap();
+        assert_eq!(
+            Http3Priority::try_from(priority_value.as_slice()),
+            Ok(Http3Priority {
+                urgency: 5,
+                incremental: false
+            })
+        );
 
         assert_eq!(s.server_poll(), Err(Http3Error::Done));
     }
@@ -4630,7 +4619,12 @@ mod tests {
     // Client send a PRIORITY_UPDATE(request) for a closed stream.
     #[test]
     fn client_send_priority_update_request_on_closed_stream() {
-        let mut s = Session::new().unwrap();
+        let h3_conf = Http3Config::new().unwrap();
+        let mut cli_conf = Session::new_test_config(false).unwrap();
+        cli_conf.set_ack_eliciting_threshold(1);
+        let mut srv_conf = Session::new_test_config(true).unwrap();
+        srv_conf.set_ack_eliciting_threshold(1);
+        let mut s = Session::new_with_test_config(&mut cli_conf, &mut srv_conf, &h3_conf).unwrap();
 
         // Client send a request with FIN flag.
         let (stream_id, req_headers) = s.send_request(true).unwrap();
@@ -4818,7 +4812,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "sfv")]
     fn parse_extensible_priority() {
         for (priority, urgency, incremental) in [
             ("", PRIORITY_URGENCY_DEFAULT, PRIORITY_INCREMENTAL_DEFAULT),
@@ -4998,7 +4991,7 @@ mod tests {
         assert_eq!(s.client_poll(), Err(Http3Error::IdError));
     }
 
-    // Server try to send GOAWAY frame on a uninitialized control stream.
+    // Server try to send GOAWAY frame on an uninitialized control stream.
     #[test]
     fn server_send_goaway_on_uninitialized_control_stream() {
         let mut s = Session::new().unwrap();
