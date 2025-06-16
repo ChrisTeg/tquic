@@ -1006,7 +1006,14 @@ void quic_conn_session(struct quic_conn_t *conn, const uint8_t **out, size_t *ou
 /**
  * Return details why 0-RTT was accepted or rejected.
  */
-int quic_conn_early_data_reason(struct quic_conn_t *conn, const uint8_t **out, size_t *out_len);
+int quic_conn_early_data_reason(struct quic_conn_t *conn);
+
+/**
+ * Return a string representation for reason why 0-RTT was accepted or rejected.
+ */
+int quic_conn_early_data_reason_string(struct quic_conn_t *conn,
+                                       const uint8_t **out,
+                                       size_t *out_len);
 
 /**
  * Send a Ping frame on the active path(s) for keep-alive.

@@ -1083,12 +1083,18 @@ pub extern "C" fn quic_conn_session(
 
 /// Return details why 0-RTT was accepted or rejected.
 #[no_mangle]
-pub extern "C" fn quic_conn_early_data_reason(
+pub extern "C" fn quic_conn_early_data_reason(conn: &mut Connection) -> c_int {
+    conn.early_data_reason() as c_int
+}
+
+/// Return a string representation for reason why 0-RTT was accepted or rejected.
+#[no_mangle]
+pub extern "C" fn quic_conn_early_data_reason_string(
     conn: &mut Connection,
     out: &mut *const u8,
     out_len: &mut size_t,
 ) -> c_int {
-    match conn.early_data_reason() {
+    match conn.early_data_reason_string() {
         Ok(reason) => {
             match reason {
                 Some(reason) => {

@@ -3401,8 +3401,13 @@ impl Connection {
     }
 
     /// Return details why 0-RTT was accepted or rejected.
-    pub fn early_data_reason(&self) -> Result<Option<&str>> {
+    pub fn early_data_reason(&self) -> tls::SslEarlyDataReason {
         self.tls_session.early_data_reason()
+    }
+
+    /// Return a string representation for reason why 0-RTT was accepted or rejected.
+    pub fn early_data_reason_string(&self) -> Result<Option<&str>> {
+        self.tls_session.early_data_reason_string()
     }
 
     /// Check whether the connection is draining.

@@ -41,6 +41,7 @@ pub use boringssl::crypto::Algorithm;
 pub use boringssl::crypto::Open;
 pub use boringssl::crypto::Seal;
 pub use boringssl::tls::SslCtx;
+pub use boringssl::tls::SslEarlyDataReason;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, EnumIter, EnumCount)]
@@ -581,8 +582,12 @@ impl TlsSession {
         self.session.peer_sign_algor()
     }
 
-    pub fn early_data_reason(&self) -> Result<Option<&str>> {
+    pub fn early_data_reason(&self) -> SslEarlyDataReason {
         self.session.early_data_reason()
+    }
+
+    pub fn early_data_reason_string(&self) -> Result<Option<&str>> {
+        self.session.early_data_reason_string()
     }
 }
 
@@ -1020,6 +1025,14 @@ pub(crate) mod tests {
         assert!(tls_session_pair.client.is_resumed());
         assert!(tls_session_pair.server.is_completed());
         assert!(tls_session_pair.server.is_resumed());
+        assert_eq!(
+            tls_session_pair.server.early_data_reason_string(),
+            Ok(Some("accepted"))
+        );
+        assert_eq!(
+            tls_session_pair.server.early_data_reason(),
+            SslEarlyDataReason::Accepted
+        );
         tls_session_pair.check_keys(true)
     }
 
@@ -1045,6 +1058,14 @@ pub(crate) mod tests {
         assert!(tls_session_pair.client.is_resumed());
         assert!(tls_session_pair.server.is_completed());
         assert!(tls_session_pair.server.is_resumed());
+        assert_eq!(
+            tls_session_pair.server.early_data_reason_string(),
+            Ok(Some("disabled"))
+        );
+        assert_eq!(
+            tls_session_pair.server.early_data_reason(),
+            SslEarlyDataReason::Disabled
+        );
         tls_session_pair.check_keys(false)
     }
 
@@ -1071,6 +1092,14 @@ pub(crate) mod tests {
         assert!(tls_session_pair.client.data.early_data_rejected);
         assert!(tls_session_pair.server.is_completed());
         assert!(tls_session_pair.server.is_resumed());
+        assert_eq!(
+            tls_session_pair.server.early_data_reason_string(),
+            Ok(Some("disabled"))
+        );
+        assert_eq!(
+            tls_session_pair.server.early_data_reason(),
+            SslEarlyDataReason::Disabled
+        );
         tls_session_pair.check_keys(false)
     }
 
@@ -1098,6 +1127,14 @@ pub(crate) mod tests {
         assert!(tls_session_pair.client.data.early_data_rejected);
         assert!(tls_session_pair.server.is_completed());
         assert!(!tls_session_pair.server.is_resumed());
+        assert_eq!(
+            tls_session_pair.server.early_data_reason_string(),
+            Ok(Some("session_not_resumed"))
+        );
+        assert_eq!(
+            tls_session_pair.server.early_data_reason(),
+            SslEarlyDataReason::SessionNotResumed
+        );
         tls_session_pair.check_keys(false)
     }
 

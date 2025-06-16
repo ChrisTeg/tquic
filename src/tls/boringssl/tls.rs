@@ -92,7 +92,8 @@ struct SslQuicMethod {
 }
 
 #[repr(C)]
-enum SslEarlyDataReason {
+#[derive(PartialEq, Debug)]
+pub enum SslEarlyDataReason {
     // The handshake has not progressed far enough for the 0-RTT status to be known.
     Unknown = 0,
     // 0-RTT is disabled for this connection.
@@ -774,7 +775,11 @@ impl Session {
         Some(peer_cert)
     }
 
-    pub fn early_data_reason(&self) -> Result<Option<&str>> {
+    pub fn early_data_reason(&self) -> SslEarlyDataReason {
+        unsafe { SSL_get_early_data_reason(self.as_ptr()) }
+    }
+
+    pub fn early_data_reason_string(&self) -> Result<Option<&str>> {
         let reason = unsafe {
             let reason = SSL_early_data_reason_string(SSL_get_early_data_reason(self.as_ptr()));
             match ffi::CStr::from_ptr(reason).to_str() {
