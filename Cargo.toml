@@ -2,7 +2,7 @@
 name = "tquic"
 version = "1.6.0"
 edition = "2021"
-rust-version = "1.70.0"
+rust-version = "1.87.0"
 license = "Apache-2.0"
 repository = "https://github.com/tencent/tquic"
 homepage = "https://tquic.net"

@@ -15,7 +15,7 @@
 # QUIC docker image for interoperability testing.
 # See: https://github.com/marten-seemann/quic-interop-runner
 
-FROM rust:1.70 as build
+FROM rust:1.87 as build
 
 WORKDIR /build
 
