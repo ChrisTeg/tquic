@@ -37,6 +37,7 @@ use crate::Error;
 use crate::Result;
 
 pub use boringssl::crypto::derive_initial_secrets;
+pub use boringssl::crypto::verify_slices_are_equal;
 pub use boringssl::crypto::Algorithm;
 pub use boringssl::crypto::Open;
 pub use boringssl::crypto::Seal;

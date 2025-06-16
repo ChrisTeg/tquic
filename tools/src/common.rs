@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::ErrorKind;
 use std::net::SocketAddr;
 
 use clap::builder::PossibleValue;
@@ -162,7 +161,7 @@ impl QuicSocket {
     ) -> std::io::Result<(usize, SocketAddr, SocketAddr)> {
         let socket = match self.socks.get(token.0) {
             Some(socket) => socket,
-            None => return Err(std::io::Error::new(ErrorKind::Other, "invalid token")),
+            None => return Err(std::io::Error::other("invalid token")),
         };
 
         match socket.recv_from(buf) {

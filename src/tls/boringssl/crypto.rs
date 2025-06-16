@@ -412,6 +412,29 @@ fn build_nonce(iv: &[u8], cid_seq: Option<u32>, counter: u64) -> [u8; aead::NONC
     nonce
 }
 
+/// Verify slices are equal
+///
+/// Returns Ok if `a` and `b` contain the same bytes. It takes an amount of time dependent on the
+/// lengths, but independent of the contents of the slices `a` and `b`.
+pub fn verify_slices_are_equal(a: &[u8], b: &[u8]) -> Result<()> {
+    if a.len() != b.len() {
+        return Err(Error::CryptoFail);
+    }
+
+    let result = unsafe {
+        CRYPTO_memcmp(
+            a.as_ptr() as *const c_void,
+            b.as_ptr() as *const c_void,
+            a.len(),
+        )
+    };
+
+    match result {
+        0 => Ok(()),
+        _ => Err(Error::CryptoFail),
+    }
+}
+
 #[repr(transparent)]
 struct EvpAead(c_void);
 
@@ -470,4 +493,7 @@ extern "C" {
         ad: *const u8,
         ad_len: usize,
     ) -> c_int;
+
+    /// Constant-time comparison
+    fn CRYPTO_memcmp(a: *const c_void, b: *const c_void, len: usize) -> c_int;
 }
