@@ -677,7 +677,7 @@ pub(crate) fn packet_num_len(pkt_num: u64, largest_acked: Option<u64>) -> usize 
     };
 
     let min_bits = u64::BITS - num_unacked.leading_zeros() + 1; // ceil(log(num_unacked, 2)) + 1
-    ((min_bits + 7) / 8) as usize // ceil(min_bits / 8)
+    min_bits.div_ceil(8) as usize // ceil(min_bits / 8)
 }
 
 /// Encode a Version Negotiation packet to the given buffer
